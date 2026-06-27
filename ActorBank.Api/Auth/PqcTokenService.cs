@@ -13,15 +13,18 @@ namespace ActorBank.Api.Auth;
 /// post-quantum signature scheme. Tokens look like a JWT (<c>header.payload.signature</c>) but the
 /// signature is quantum-resistant instead of RSA/ECDSA.
 ///
-/// The single <see cref="MLDsa"/> key is shared, so all crypto runs under one lock — correct and
-/// race-free (auth is not the throughput hot path).
+/// <b>Signing</b> (rare — only at <c>/auth/token</c>) runs under a lock on the private key.
+/// <b>Verification</b> (every authenticated request) is lock-free: each thread gets its own
+/// public-key verifier, so token checks run fully in parallel.
 /// </summary>
 public sealed class PqcTokenService : IDisposable
 {
     private const string AlgorithmId = "ML-DSA-65";
 
     private readonly PqcTokenOptions _options;
-    private readonly MLDsa _key;
+    private readonly MLDsa _key;                 // private key — signing only, guarded by _gate
+    private readonly byte[] _publicKey;          // SubjectPublicKeyInfo, immutable after construction
+    private readonly ThreadLocal<MLDsa> _verifiers; // one verifier per thread → concurrent verification
     private readonly string _kid;
     private readonly Lock _gate = new();
 
@@ -29,7 +32,10 @@ public sealed class PqcTokenService : IDisposable
     {
         _options = options.Value;
         _key = LoadOrCreateKey(_options.KeyFilePath, logger);
-        _kid = ComputeKeyId(_key);
+        _publicKey = _key.ExportSubjectPublicKeyInfo();
+        _verifiers = new ThreadLocal<MLDsa>(
+            () => MLDsa.ImportSubjectPublicKeyInfo(_publicKey), trackAllValues: true);
+        _kid = ComputeKeyId(_publicKey);
     }
 
     public string Algorithm => AlgorithmId;
@@ -80,10 +86,8 @@ public sealed class PqcTokenService : IDisposable
         var signingInput = Encoding.ASCII.GetBytes($"{parts[0]}.{parts[1]}");
         byte[] signature = SafeDecode(parts[2]);
 
-        bool valid;
-        lock (_gate)
-            valid = _key.VerifyData(signingInput, signature);
-        if (!valid)
+        // Lock-free: this thread's own public-key verifier.
+        if (!_verifiers.Value!.VerifyData(signingInput, signature))
             throw new AuthenticationException("Invalid token signature.");
 
         using var doc = JsonDocument.Parse(SafeDecode(parts[1]));
@@ -178,13 +182,21 @@ public sealed class PqcTokenService : IDisposable
         throw new InvalidOperationException($"Could not load or create the signing key at '{path}'.");
     }
 
-    private static string ComputeKeyId(MLDsa key)
+    private static string ComputeKeyId(byte[] subjectPublicKeyInfo)
     {
-        var thumbprint = SHA256.HashData(key.ExportSubjectPublicKeyInfo());
+        var thumbprint = SHA256.HashData(subjectPublicKeyInfo);
         return Base64Url.EncodeToString(thumbprint.AsSpan(0, 8));
     }
 
-    public void Dispose() => _key.Dispose();
+    public void Dispose()
+    {
+        // Each thread that verified a token holds its own MLDsa verifier; dispose them all.
+        if (_verifiers.Values is { } verifiers)
+            foreach (var verifier in verifiers)
+                verifier.Dispose();
+        _verifiers.Dispose();
+        _key.Dispose();
+    }
 }
 
 /// <summary>Source-generated log messages for <see cref="PqcTokenService"/>.</summary>

@@ -25,9 +25,11 @@ public static class AccountEndpoints
         accounts.MapPost("/{id}/open", async (string id, OpenRequest request, IGrainFactory grains, IOptions<InterestOptions> interest) =>
         {
             var statement = await grains.GetGrain<IAccountGrain>(id).Open(request.Owner, request.OpeningDeposit);
-            // Start accruing interest on a durable reminder (registered after the account exists).
-            await grains.GetGrain<IAccountScheduleGrain>(id)
-                .EnsureInterestSchedule(interest.Value.PeriodMinutes, interest.Value.RatePercentPerPeriod);
+            // Enroll the account into its interest-sweep shard (one durable reminder per shard, not
+            // per account), registered after the account exists.
+            var shard = InterestSharding.ShardOf(id, interest.Value.SweepShards);
+            await grains.GetGrain<IInterestSweepGrain>(shard)
+                .Enroll(id, interest.Value.RatePercentPerPeriod, interest.Value.PeriodMinutes);
             return TypedResults.Created($"/accounts/{id}", statement);
         })
         .WithSummary("Open an account (and start its interest schedule)");

@@ -1,5 +1,5 @@
 // Functional + auth smoke test: one pass through the whole API, asserting correctness.
-// Run: ./perf/run.sh smoke.js
+// Run: ./k6/run.sh smoke.js
 import http from 'k6/http';
 import { check } from 'k6';
 import { BASE, register, token, openAccount, authHeaders, uniqueUser } from './lib.js';

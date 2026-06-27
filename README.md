@@ -17,7 +17,7 @@ and money transfers between two accounts are **ACID** via Orleans transactions.
 - **Interactive docs** — OpenAPI document + **Scalar** UI at `/scalar/v1`.
 - **Quantum-resistant auth** — bearer tokens signed with **ML-DSA-65** (NIST FIPS 204); per-account authorization.
 - **Scale-out clustering** — ADO.NET membership in PostgreSQL; many silos form one cluster.
-- **Scheduled interest** — durable Orleans reminders credit interest on a recurring tick.
+- **Scheduled interest** — a fixed pool of sweep grains credit interest on a recurring tick (one durable reminder per shard, not per account).
 - **Runs in Docker** — one `docker compose up` brings up Postgres + the API.
 - **.NET 10 performance** — source-generated JSON & logging, `TypedResults`, Server GC + Tiered PGO.
 
@@ -34,14 +34,14 @@ ActorBank/
 ├─ tests/                         # k6 load/consistency tests + xUnit ACID suite
 │
 ├─ ActorBank.Abstractions/        # the contract
-│  ├─ Accounts/  IAccountGrain.cs, IAccountScheduleGrain.cs
+│  ├─ Accounts/  IAccountGrain.cs, IInterestSweepGrain.cs, InterestSharding.cs
 │  ├─ Ledger/    ILedgerPageGrain.cs, LedgerPaging.cs
 │  ├─ Auth/      ICredentialGrain.cs
 │  ├─ Models/    AccountStatement, TransactionRecord, TransactionType
 │  └─ Exceptions/ BankException + domain errors
 │
 ├─ ActorBank.Grains/              # the implementation
-│  ├─ Accounts/  AccountGrain, AccountState, AccountScheduleGrain (interest reminder)
+│  ├─ Accounts/  AccountGrain, AccountState, InterestSweepGrain (sharded interest sweep)
 │  ├─ Ledger/    LedgerPageGrain, LedgerPageState
 │  └─ Auth/      CredentialGrain, CredentialState, PasswordHasher
 │
@@ -200,9 +200,12 @@ ActorBank instead signs tokens with **ML-DSA-65** (NIST FIPS 204, a.k.a. CRYSTAL
   migration (which adds the `CleanupDefunctSiloEntries` query the 10.2.1 runtime requires).
 - **Clustering.** `UseAdoNetClustering` + a `ClusterId`/`ServiceId` — silos discover each other through
   the membership tables, so the same image scales to many nodes against one database.
-- **Reminders.** Each account's interest runs on a durable reminder owned by a separate
-  `AccountScheduleGrain` (a grain calling *itself* would deadlock), which ticks and calls
-  `AccountGrain.ApplyInterest` — a transactional credit that also writes a ledger entry.
+- **Reminders.** Interest runs on a small, fixed pool of `InterestSweepGrain` shards — each owns one
+  durable reminder and, on each tick, credits every account enrolled in its shard by calling
+  `AccountGrain.ApplyInterest` (a transactional credit that also writes a ledger entry). Accounts map
+  to shards via `InterestSharding` (a stable FNV-1a hash), so millions of accounts cost a fixed number
+  of reminders instead of one each. The sweep grain calls the account as a normal grain-to-grain
+  message; a grain calling *itself* would deadlock.
 
 ## Configuration
 
@@ -227,7 +230,7 @@ unchanged. It's how the transfer deadlock above was found and the fix verified.
 
 - ~~**ADO.NET clustering**~~ — `UseAdoNetClustering`; silos form one cluster via PostgreSQL membership.
 - ~~**Containerize**~~ — `Dockerfile` (Alpine 3.23) + the API in `docker-compose`.
-- ~~**Reminders**~~ — scheduled interest via a durable reminder on `AccountScheduleGrain`.
+- ~~**Reminders**~~ — scheduled interest via a sharded sweep over `InterestSweepGrain` (one reminder per shard).
 - ~~**AuthN/Z**~~ — post-quantum (ML-DSA-65) bearer tokens + per-account authorization.
 
 ## Next steps (roadmap)
