@@ -1,0 +1,10 @@
+bin/
+obj/
+*.user
+.vs/
+
+# Post-quantum signing key — never commit private keys
+*.pkcs8
+
+# JetBrains IDE
+.idea/

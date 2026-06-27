@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ActorBank.Abstractions\ActorBank.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Orleans.Sdk" />
+    <PackageReference Include="Microsoft.Orleans.Runtime" />
+    <PackageReference Include="Microsoft.Orleans.Transactions" />
+    <PackageReference Include="Microsoft.Orleans.Reminders" />
+  </ItemGroup>
+
+</Project>

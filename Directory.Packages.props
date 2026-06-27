@@ -1,0 +1,29 @@
+<Project>
+
+  <!-- Central Package Management: one place for every NuGet version. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Orleans.Sdk" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Runtime" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Server" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Transactions" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Persistence.AdoNet" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Clustering.AdoNet" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Reminders" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.Orleans.Reminders.AdoNet" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
+    <PackageVersion Include="Scalar.AspNetCore" Version="2.16.6" />
+    <PackageVersion Include="Npgsql" Version="9.0.3" />
+
+    <!-- Tests -->
+    <PackageVersion Include="Microsoft.Orleans.TestingHost" Version="10.2.1" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <PackageVersion Include="coverlet.collector" Version="6.0.4" />
+  </ItemGroup>
+
+</Project>

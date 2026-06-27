@@ -1,0 +1,6 @@
+**/bin/
+**/obj/
+.git/
+.vs/
+*.pkcs8
+**/appsettings.Development.json

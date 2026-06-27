@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- CA1707: underscores are idiomatic in test method names. CA1859: micro-opt, N/A for tests. -->
+    <NoWarn>$(NoWarn);CA1707;CA1859</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\ActorBank.Grains\ActorBank.Grains.csproj" />
+    <ProjectReference Include="..\..\ActorBank.Abstractions\ActorBank.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Code generator: needed so the test-only coordinator grain is discovered + serializable. -->
+    <PackageReference Include="Microsoft.Orleans.Sdk" />
+    <PackageReference Include="Microsoft.Orleans.TestingHost" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="coverlet.collector" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>
