@@ -11,34 +11,35 @@ public interface IAccountGrain : IGrainWithStringKey
     [Transaction(TransactionOption.CreateOrJoin)]
     Task<AccountStatement> Open(string ownerName, decimal openingDeposit = 0m);
 
-    /// <summary>Credits the account and returns the new balance.</summary>
+    /// <summary>Credits the account and returns the new balance (with its version).</summary>
     [Transaction(TransactionOption.CreateOrJoin)]
-    Task<decimal> Deposit(decimal amount, string? description = null);
+    Task<BalanceUpdate> Deposit(decimal amount, string? description = null);
 
-    /// <summary>Debits the account and returns the new balance.</summary>
+    /// <summary>Debits the account and returns the new balance (with its version).</summary>
     /// <exception cref="InsufficientFundsException">When <paramref name="amount"/> exceeds the balance.</exception>
     [Transaction(TransactionOption.CreateOrJoin)]
-    Task<decimal> Withdraw(decimal amount, string? description = null);
+    Task<BalanceUpdate> Withdraw(decimal amount, string? description = null);
 
     /// <summary>
-    /// Debit leg of a transfer (records a TransferOut entry). The two legs are composed into one
-    /// transaction by the caller (the API via <c>ITransactionClient</c>) — account grains never call
-    /// each other, which avoids a turn-based deadlock between two opposing transfers.
+    /// Debit leg of a transfer (records a TransferOut entry); returns the debited account's new balance
+    /// so the caller can update its read model. The two legs are composed into one transaction by the
+    /// caller (the API via <c>ITransactionClient</c>) — account grains never call each other, which
+    /// avoids a turn-based deadlock between two opposing transfers.
     /// </summary>
     /// <exception cref="InsufficientFundsException">When <paramref name="amount"/> exceeds the balance.</exception>
     [Transaction(TransactionOption.CreateOrJoin)]
-    Task DebitForTransfer(decimal amount, string toAccountId, string? description = null);
+    Task<BalanceUpdate> DebitForTransfer(decimal amount, string toAccountId, string? description = null);
 
-    /// <summary>Credit leg of a transfer. Joins the caller's transaction.</summary>
+    /// <summary>Credit leg of a transfer; returns the credited account's new balance. Joins the caller's transaction.</summary>
     [Transaction(TransactionOption.CreateOrJoin)]
-    Task AcceptTransfer(string fromAccountId, decimal amount, string? description = null);
+    Task<BalanceUpdate> AcceptTransfer(string fromAccountId, decimal amount, string? description = null);
 
     /// <summary>
     /// Credits interest of <paramref name="ratePercent"/>% on the current balance and returns the new
     /// balance. A no-op on a closed or empty account. Called by the scheduler on a reminder tick.
     /// </summary>
     [Transaction(TransactionOption.CreateOrJoin)]
-    Task<decimal> ApplyInterest(decimal ratePercent);
+    Task<BalanceUpdate> ApplyInterest(decimal ratePercent);
 
     /// <summary>Returns the current balance.</summary>
     [Transaction(TransactionOption.CreateOrJoin)]

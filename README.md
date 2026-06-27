@@ -53,13 +53,13 @@ account that processes one message at a time **is** a serialized balance. Correc
 model itself.
 
 ```
-        message in                              message in
-   ────────────────────►  ┌──────────────┐  ◄────────────────────
-   deposit(50)            │   Account     │            withdraw(30)
-                          │  ── mailbox ──│  ← messages queue here
-   one at a time  ───────►│  Balance=100  │  one at a time
-                          │  (private)    │
-                          └──────────────┘
+        message in                                 message in
+   ────────────────────►  ┌────────────────┐  ◄────────────────────
+        deposit(50)       │     Account    │       withdraw(30)
+                          │  ── mailbox ── │  ← messages queue here
+   one at a time  ───────►│   Balance=100  │  one at a time
+                          │    (private)   │
+                          └────────────────┘
               processes deposit → 150, THEN withdraw → 120
               never both at once → no lock, no lost update
 ```
@@ -187,18 +187,18 @@ A transfer, as one ACID transaction (2PC), composed by the API:
    POST /accounts/alice/transfer  ──┐
                                     ▼
                          ┌─────────────────────────────┐
-                         │  API transaction coordinator │   (ITransactionClient)
+                         │ API transaction coordinator │   (ITransactionClient)
                          └─────────────────────────────┘
               id-ordered legs │                       │
                               ▼                        ▼
                    ┌────────────────────┐    ┌────────────────────┐
-                   │ AccountGrain alice │    │ AccountGrain bob   │
-                   │  Balance -300      │    │  Balance +300      │
+                   │ AccountGrain alice │    │  AccountGrain bob  │
+                   │    Balance -300    │    │    Balance +300    │
                    └─────────┬──────────┘    └─────────┬──────────┘
                              ▼                          ▼
                    ┌────────────────────┐    ┌────────────────────┐
-                   │ LedgerPageGrain    │    │ LedgerPageGrain    │
-                   │ alice/3  +entry    │    │ bob/7   +entry     │
+                   │  LedgerPageGrain   │    │  LedgerPageGrain   │
+                   │  alice/3  +entry   │    │  bob/7   +entry    │
                    └────────────────────┘    └────────────────────┘
             All four enlisted in ONE transaction → commit together or roll back together.
 ```
@@ -279,10 +279,10 @@ cross-silo grain call; location transparency makes that invisible to the endpoin
         ┌─────────┐     HTTP (stateless, round-robined)
 client ─┤  nginx  ├──────────────┬───────────────┬───────────────┐
         └─────────┘              ▼               ▼               ▼
-                          ┌────────────┐  ┌────────────┐  ┌────────────┐
-                          │  app #1     │  │  app #2     │  │  app #3     │
+                          ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+                          │   app #1    │  │   app #2    │  │   app #3    │
                           │ API + silo  │  │ API + silo  │  │ API + silo  │
-                          └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
+                          └─────┬───────┘  └─────┬───────┘  └──────┬──────┘
                                 └─────── one Orleans cluster ────┘
                                   grains placed across silos;
                                   calls routed by the grain directory

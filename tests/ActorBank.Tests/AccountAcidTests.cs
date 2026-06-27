@@ -27,8 +27,8 @@ public sealed class AccountAcidTests : IClassFixture<ClusterFixture>
     {
         var id = NewId();
         await OpenAsync(id, 1000m);
-        Assert.Equal(1250m, await Account(id).Deposit(250m));
-        Assert.Equal(1175m, await Account(id).Withdraw(75m));
+        Assert.Equal(1250m, (await Account(id).Deposit(250m)).Balance);
+        Assert.Equal(1175m, (await Account(id).Withdraw(75m)).Balance);
     }
 
     [Fact]
@@ -159,7 +159,7 @@ public sealed class AccountAcidTests : IClassFixture<ClusterFixture>
         await OpenAsync(id, 1000m);
         var account = Account(id);
 
-        Assert.Equal(1010m, await account.ApplyInterest(1m)); // 1% of 1000
+        Assert.Equal(1010m, (await account.ApplyInterest(1m)).Balance); // 1% of 1000
 
         var statement = await account.GetStatement();
         Assert.Contains(statement.Transactions, t => t.Type == TransactionType.Interest && t.Amount == 10m);

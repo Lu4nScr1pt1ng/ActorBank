@@ -36,15 +36,17 @@ public static class AccountEndpoints
 
         accounts.MapPost("/{id}/deposit", async (string id, AmountRequest request, IGrainFactory grains) =>
         {
-            var balance = await grains.GetGrain<IAccountGrain>(id).Deposit(request.Amount, request.Description);
-            return TypedResults.Ok(new BalanceResponse(id, balance));
+            var update = await grains.GetGrain<IAccountGrain>(id).Deposit(request.Amount, request.Description);
+            await TryPublish(grains, id, update); // post-commit: refresh the balance read model
+            return TypedResults.Ok(new BalanceResponse(id, update.Balance));
         })
         .WithSummary("Deposit money");
 
         accounts.MapPost("/{id}/withdraw", async (string id, AmountRequest request, IGrainFactory grains) =>
         {
-            var balance = await grains.GetGrain<IAccountGrain>(id).Withdraw(request.Amount, request.Description);
-            return TypedResults.Ok(new BalanceResponse(id, balance));
+            var update = await grains.GetGrain<IAccountGrain>(id).Withdraw(request.Amount, request.Description);
+            await TryPublish(grains, id, update); // post-commit: refresh the balance read model
+            return TypedResults.Ok(new BalanceResponse(id, update.Balance));
         })
         .WithSummary("Withdraw money");
 
@@ -59,26 +61,40 @@ public static class AccountEndpoints
             // One transaction across both accounts, orchestrated here (not by a grain) so the two
             // account grains never call each other. The legs are issued in id order to keep lock
             // acquisition consistent and deadlock-free.
+            BalanceUpdate fromUpdate = null!, toUpdate = null!;
             await transactions.RunTransaction(TransactionOption.Create, async () =>
             {
                 if (string.CompareOrdinal(id, request.ToAccountId) < 0)
                 {
-                    await from.DebitForTransfer(request.Amount, request.ToAccountId, request.Description);
-                    await to.AcceptTransfer(id, request.Amount, request.Description);
+                    fromUpdate = await from.DebitForTransfer(request.Amount, request.ToAccountId, request.Description);
+                    toUpdate = await to.AcceptTransfer(id, request.Amount, request.Description);
                 }
                 else
                 {
-                    await to.AcceptTransfer(id, request.Amount, request.Description);
-                    await from.DebitForTransfer(request.Amount, request.ToAccountId, request.Description);
+                    toUpdate = await to.AcceptTransfer(id, request.Amount, request.Description);
+                    fromUpdate = await from.DebitForTransfer(request.Amount, request.ToAccountId, request.Description);
                 }
             });
 
+            // Post-commit: refresh both balance read models.
+            await TryPublish(grains, id, fromUpdate);
+            await TryPublish(grains, request.ToAccountId, toUpdate);
             return TypedResults.NoContent();
         })
         .WithSummary("Atomically transfer money to another account");
 
         accounts.MapGet("/{id}/balance", async (string id, IGrainFactory grains) =>
-            TypedResults.Ok(new BalanceResponse(id, await grains.GetGrain<IAccountGrain>(id).GetBalance())))
+        {
+            // Served from the non-transactional read model; a cold miss falls back to the authoritative
+            // (transactional) read and seeds the projection with a floor version that any real op supersedes.
+            var cached = await grains.GetGrain<IAccountReadModelGrain>(id).TryGetBalance();
+            if (cached is decimal known)
+                return TypedResults.Ok(new BalanceResponse(id, known));
+
+            var balance = await grains.GetGrain<IAccountGrain>(id).GetBalance();
+            await TryPublish(grains, id, new BalanceUpdate(balance, long.MinValue));
+            return TypedResults.Ok(new BalanceResponse(id, balance));
+        })
         .WithSummary("Get the current balance");
 
         accounts.MapGet("/{id}/statement", async (string id, int? take, IGrainFactory grains) =>
@@ -86,5 +102,18 @@ public static class AccountEndpoints
         .WithSummary("Get a statement (most recent transactions)");
 
         return app;
+    }
+
+    /// <summary>Best-effort publish to an account's balance read model — a failure just leaves it to self-heal.</summary>
+    private static async Task TryPublish(IGrainFactory grains, string id, BalanceUpdate update)
+    {
+        try
+        {
+            await grains.GetGrain<IAccountReadModelGrain>(id).Publish(update);
+        }
+        catch
+        {
+            // The read model is eventually consistent; the next op or read re-seeds it.
+        }
     }
 }

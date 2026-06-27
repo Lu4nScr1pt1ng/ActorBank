@@ -69,7 +69,9 @@ public sealed class InterestSweepGrain : Grain, IInterestSweepGrain, IRemindable
     {
         try
         {
-            await GrainFactory.GetGrain<IAccountGrain>(accountId).ApplyInterest(rate);
+            var update = await GrainFactory.GetGrain<IAccountGrain>(accountId).ApplyInterest(rate);
+            // Post-commit: refresh the balance read model (best-effort; it self-heals otherwise).
+            await GrainFactory.GetGrain<IAccountReadModelGrain>(accountId).Publish(update);
             return true;
         }
         catch (Exception ex)

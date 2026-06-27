@@ -38,7 +38,7 @@ public sealed class AccountGrain : Grain, IAccountGrain
             s.Owner = ownerName;
             return openingDeposit > 0
                 ? ApplyEntry(s, +openingDeposit, TransactionType.OpeningDeposit, openingDeposit, "Opening deposit")
-                : NoMove(s.Balance);
+                : NoMove(s.Balance, s.LedgerCount);
         });
 
         await FlushIfNeeded(move);
@@ -46,7 +46,7 @@ public sealed class AccountGrain : Grain, IAccountGrain
         return await GetStatement();
     }
 
-    public async Task<decimal> Deposit(decimal amount, string? description = null)
+    public async Task<BalanceUpdate> Deposit(decimal amount, string? description = null)
     {
         EnsurePositive(amount);
         var move = await _account.PerformUpdate(s =>
@@ -56,10 +56,10 @@ public sealed class AccountGrain : Grain, IAccountGrain
         });
 
         await FlushIfNeeded(move);
-        return move.Balance;
+        return new BalanceUpdate(move.Balance, move.Version);
     }
 
-    public async Task<decimal> Withdraw(decimal amount, string? description = null)
+    public async Task<BalanceUpdate> Withdraw(decimal amount, string? description = null)
     {
         EnsurePositive(amount);
         var move = await _account.PerformUpdate(s =>
@@ -71,10 +71,10 @@ public sealed class AccountGrain : Grain, IAccountGrain
         });
 
         await FlushIfNeeded(move);
-        return move.Balance;
+        return new BalanceUpdate(move.Balance, move.Version);
     }
 
-    public async Task DebitForTransfer(decimal amount, string toAccountId, string? description = null)
+    public async Task<BalanceUpdate> DebitForTransfer(decimal amount, string toAccountId, string? description = null)
     {
         EnsurePositive(amount);
         var move = await _account.PerformUpdate(s =>
@@ -86,9 +86,10 @@ public sealed class AccountGrain : Grain, IAccountGrain
         });
 
         await FlushIfNeeded(move);
+        return new BalanceUpdate(move.Balance, move.Version);
     }
 
-    public async Task AcceptTransfer(string fromAccountId, decimal amount, string? description = null)
+    public async Task<BalanceUpdate> AcceptTransfer(string fromAccountId, decimal amount, string? description = null)
     {
         EnsurePositive(amount);
         var move = await _account.PerformUpdate(s =>
@@ -98,24 +99,25 @@ public sealed class AccountGrain : Grain, IAccountGrain
         });
 
         await FlushIfNeeded(move);
+        return new BalanceUpdate(move.Balance, move.Version);
     }
 
-    public async Task<decimal> ApplyInterest(decimal ratePercent)
+    public async Task<BalanceUpdate> ApplyInterest(decimal ratePercent)
     {
         var move = await _account.PerformUpdate(s =>
         {
             if (!s.IsOpen || s.Balance <= 0 || ratePercent <= 0)
-                return NoMove(s.Balance);
+                return NoMove(s.Balance, s.LedgerCount);
 
             var interest = decimal.Round(s.Balance * ratePercent / 100m, 2, MidpointRounding.ToEven);
             if (interest <= 0)
-                return NoMove(s.Balance);
+                return NoMove(s.Balance, s.LedgerCount);
 
             return ApplyEntry(s, +interest, TransactionType.Interest, interest, "Interest");
         });
 
         await FlushIfNeeded(move);
-        return move.Balance;
+        return new BalanceUpdate(move.Balance, move.Version);
     }
 
     public Task<decimal> GetBalance() =>
@@ -139,10 +141,11 @@ public sealed class AccountGrain : Grain, IAccountGrain
 
     // --- helpers ---------------------------------------------------------
 
-    // The state-update result: new balance, plus a completed page to flush (if any). A value tuple,
-    // because Orleans deep-copies whatever PerformUpdate returns and has built-in tuple/List copiers.
-    private static (decimal Balance, List<TransactionRecord>? FlushPage, long FlushPageNum) NoMove(decimal balance) =>
-        (balance, null, -1L);
+    // The state-update result: new balance, its version (LedgerCount), plus a completed page to flush
+    // (if any). A value tuple, because Orleans deep-copies whatever PerformUpdate returns and has
+    // built-in tuple/List copiers.
+    private static (decimal Balance, long Version, List<TransactionRecord>? FlushPage, long FlushPageNum) NoMove(
+        decimal balance, long version) => (balance, version, null, -1L);
 
     /// <summary>
     /// Applies a balance delta, appends the matching ledger entry to the in-state current page, and —
@@ -150,7 +153,7 @@ public sealed class AccountGrain : Grain, IAccountGrain
     /// transaction). Runs inside <c>PerformUpdate</c>, so it must stay synchronous and side-effect-free
     /// beyond the state it is handed.
     /// </summary>
-    private static (decimal Balance, List<TransactionRecord>? FlushPage, long FlushPageNum) ApplyEntry(
+    private static (decimal Balance, long Version, List<TransactionRecord>? FlushPage, long FlushPageNum) ApplyEntry(
         AccountState s, decimal delta, TransactionType type, decimal amount, string description)
     {
         s.Balance += delta;
@@ -159,16 +162,16 @@ public sealed class AccountGrain : Grain, IAccountGrain
         s.CurrentPage.Add(new TransactionRecord(DateTimeOffset.UtcNow, type, amount, s.Balance, description));
 
         if (s.CurrentPage.Count < LedgerPaging.PageSize)
-            return NoMove(s.Balance);
+            return NoMove(s.Balance, s.LedgerCount);
 
         // Page complete: detach it for archival and start a fresh current page.
         var completed = s.CurrentPage;
         s.CurrentPage = [];
-        return (s.Balance, completed, LedgerPaging.PageOf(index));
+        return (s.Balance, s.LedgerCount, completed, LedgerPaging.PageOf(index));
     }
 
     /// <summary>Flushes a completed page to its archive grain, joining the caller's transaction.</summary>
-    private Task FlushIfNeeded((decimal Balance, List<TransactionRecord>? FlushPage, long FlushPageNum) move)
+    private Task FlushIfNeeded((decimal Balance, long Version, List<TransactionRecord>? FlushPage, long FlushPageNum) move)
     {
         if (move.FlushPage is null)
             return Task.CompletedTask;
