@@ -492,6 +492,19 @@ Net: a billion/day is a **sharding-into-cells** problem plus **moving reads off 
 behavior-preserving — not a "buy a bigger machine" problem. Every layer has an independent horizontal
 lever; the only thing that *must* serialize is a single account near a zero balance.
 
+**Measured impact of levers 1 & 2 (implemented).** On the same box, levers 1 and 2 raised single-cell
+throughput from the baseline above by **~1.7–1.9×** with no behaviour change:
+
+| Workload | Before | After (levers 1 + 2) |
+|---|---|---|
+| 50/50 read-write mix | ~2,100 req/s · p95 141 ms | **~3,640 req/s · p95 63 ms** |
+| read latency (avg, in the mix) | ~32 ms | **~11 ms** (served from the read model) |
+| read-only | ~2,000 req/s | **~3,770 req/s** |
+
+Co-locating the ledger (lever 2) cut writes to one transaction participant, and the read model
+(lever 1) takes balance reads off the coordinator once it is warmed by writes. Cells (lever 3) remain
+the lever for going *past* one cell.
+
 ### 7.7 The irreducible floors (honest limits)
 
 Some things cannot be parallelized away, by the nature of distributed correctness — these are floors,
@@ -603,16 +616,18 @@ Interest schedule is bound from the `Interest` section (`PeriodMinutes`, `RatePe
 
 ## 12. Roadmap
 
-**TODO (the scaling levers from §7, highest leverage first per the §7.6 benchmark)**
+**Done (the single-cell scaling levers — ~1.7–1.9× throughput, see §7.6)**
 
-1. **CQRS read model** — take the read half off the transaction path (§7.5, §7.6 lever 1).
-2. **Fewer 2PC participants per write** — co-locate the current ledger page in the account grain
-   (§7.6 lever 2).
-3. **Shard into independent cells** — route accounts to K clusters by stable hash; the real
+- ~~**CQRS read model**~~ — `GetBalance` served from a non-transactional, post-commit projection (lever 1).
+- ~~**Fewer 2PC participants per write**~~ — the current ledger page is co-located in the account grain (lever 2).
+
+**TODO (highest leverage first per the §7.6 benchmark)**
+
+1. **Shard into independent cells** — route accounts to K clusters by stable hash; the real
    horizontal lever (§7.6 lever 3). Cross-cell transfers via a saga.
-4. **Escrow-striped hot accounts** — lift the hot-single-account ceiling (§7.4).
-5. **Kubernetes** — `Microsoft.Orleans.Clustering.Kubernetes`, with the silo advertising its pod IP.
-6. **Token revocation + refresh** and **rate limiting** on `/auth`.
+2. **Escrow-striped hot accounts** — lift the hot-single-account ceiling (§7.4).
+3. **Kubernetes** — `Microsoft.Orleans.Clustering.Kubernetes`, with the silo advertising its pod IP.
+4. **Token revocation + refresh** and **rate limiting** on `/auth`.
 
 ---
 
