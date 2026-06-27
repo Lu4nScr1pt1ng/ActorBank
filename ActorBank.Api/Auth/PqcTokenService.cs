@@ -4,6 +4,7 @@ using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Options;
 
 namespace ActorBank.Api.Auth;
@@ -15,22 +16,32 @@ namespace ActorBank.Api.Auth;
 ///
 /// <b>Signing</b> (rare — only at <c>/auth/token</c>) runs under a lock on the private key.
 /// <b>Verification</b> (every authenticated request) is lock-free: each thread gets its own
-/// public-key verifier, so token checks run fully in parallel.
+/// public-key verifier, so token checks run fully in parallel. A successful verification is cached
+/// for a short window keyed by the exact token, so repeated requests with the same token skip the
+/// (relatively expensive) lattice signature check — without weakening security: a tampered token is
+/// a different key (cache miss → full verify → reject), and expiry is still enforced on every hit.
 /// </summary>
 public sealed class PqcTokenService : IDisposable
 {
     private const string AlgorithmId = "ML-DSA-65";
 
+    /// <summary>How long a validated token's principal may be served from cache (never past its exp).</summary>
+    private const int VerifyCacheSeconds = 30;
+
     private readonly PqcTokenOptions _options;
     private readonly MLDsa _key;                 // private key — signing only, guarded by _gate
     private readonly byte[] _publicKey;          // SubjectPublicKeyInfo, immutable after construction
     private readonly ThreadLocal<MLDsa> _verifiers; // one verifier per thread → concurrent verification
+    private readonly IMemoryCache _validated;    // verified token → principal (short TTL)
     private readonly string _kid;
     private readonly Lock _gate = new();
 
-    public PqcTokenService(IOptions<PqcTokenOptions> options, ILogger<PqcTokenService> logger)
+    private sealed record CachedToken(ClaimsPrincipal Principal, long ExpiresAtUnix);
+
+    public PqcTokenService(IOptions<PqcTokenOptions> options, ILogger<PqcTokenService> logger, IMemoryCache validated)
     {
         _options = options.Value;
+        _validated = validated;
         _key = LoadOrCreateKey(_options.KeyFilePath, logger);
         _publicKey = _key.ExportSubjectPublicKeyInfo();
         _verifiers = new ThreadLocal<MLDsa>(
@@ -79,6 +90,18 @@ public sealed class PqcTokenService : IDisposable
     /// <exception cref="AuthenticationException">When the token is malformed, unsigned or expired.</exception>
     public ClaimsPrincipal ValidateToken(string token)
     {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        // Fast path: this exact token already passed the full signature + claims check recently. The
+        // signature is implicitly re-verified by the cache key (a tampered token won't match); we only
+        // need to re-check time-based expiry, which is cheap and has no crypto.
+        if (_validated.TryGetValue(token, out CachedToken? hit) && hit is not null)
+        {
+            if (hit.ExpiresAtUnix <= now)
+                throw new AuthenticationException("Token has expired.");
+            return hit.Principal;
+        }
+
         var parts = token.Split('.');
         if (parts.Length != 3)
             throw new AuthenticationException("Malformed token.");
@@ -93,7 +116,6 @@ public sealed class PqcTokenService : IDisposable
         using var doc = JsonDocument.Parse(SafeDecode(parts[1]));
         var claims = doc.RootElement;
 
-        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         if (claims.TryGetProperty("exp", out var exp) && exp.GetInt64() < now)
             throw new AuthenticationException("Token has expired.");
         if (claims.TryGetProperty("nbf", out var nbf) && nbf.GetInt64() > now)
@@ -112,7 +134,21 @@ public sealed class PqcTokenService : IDisposable
         identity.AddClaim(new Claim("sub", subject));
         identity.AddClaim(new Claim(ClaimTypes.NameIdentifier, subject));
         identity.AddClaim(new Claim(ClaimTypes.Name, name));
-        return new ClaimsPrincipal(identity);
+        var principal = new ClaimsPrincipal(identity);
+
+        // Cache this verified principal until min(now + TTL, token exp), so repeated calls with the
+        // same token skip the lattice verify. Only valid tokens ever reach here, so the cache can't be
+        // flooded with garbage; a SizeLimit (configured in Program.cs) bounds it regardless.
+        var expiresAtUnix = exp.ValueKind == JsonValueKind.Number ? exp.GetInt64() : now + VerifyCacheSeconds;
+        var ttl = Math.Min(VerifyCacheSeconds, expiresAtUnix - now);
+        if (ttl > 0)
+            _validated.Set(token, new CachedToken(principal, expiresAtUnix), new MemoryCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(ttl),
+                Size = 1,
+            });
+
+        return principal;
     }
 
     /// <summary>The Base64-encoded SubjectPublicKeyInfo, for external token verification.</summary>

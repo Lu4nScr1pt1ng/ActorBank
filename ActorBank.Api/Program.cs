@@ -13,6 +13,9 @@ builder.Services.Configure<InterestOptions>(builder.Configuration.GetSection("In
 
 // Post-quantum authentication: ML-DSA-65 signed bearer tokens.
 builder.Services.Configure<PqcTokenOptions>(builder.Configuration.GetSection("Pqc"));
+// Short-lived cache of verified tokens so hot paths skip re-running the lattice signature check.
+// SizeLimit (entries) bounds memory; only valid tokens are ever cached.
+builder.Services.AddMemoryCache(options => options.SizeLimit = 50_000);
 builder.Services.AddSingleton<PqcTokenService>();
 builder.Services
     .AddAuthentication(PqcBearerDefaults.Scheme)

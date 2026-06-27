@@ -74,7 +74,10 @@ public static class OrleansConfiguration
         new NpgsqlConnectionStringBuilder(raw)
         {
             Pooling = true,
-            MaxPoolSize = 50,
+            // Each silo keeps its own pool, so transactional commits don't queue behind a tiny pool
+            // under load. Keep (silo count) × MaxPoolSize below PostgreSQL's max_connections — the
+            // compose file raises that to 500, leaving headroom for ~3 silos at this size.
+            MaxPoolSize = 128,
             ApplicationName = "ActorBank",
         }.ConnectionString;
 }

@@ -24,6 +24,29 @@ services:
       POSTGRES_DB: orleans
       POSTGRES_USER: orleans
       POSTGRES_PASSWORD: orleans
+    # Throughput tuning for a local benchmark box (8c/16t, NVMe, a few GB RAM). These are postmaster
+    # params, so they live here rather than in db/init SQL. Durability stays ON — on NVMe the WAL
+    # fsync is cheap, so synchronous_commit=on costs little. Lower shared_buffers on a small machine.
+    command:
+      - postgres
+      - -c
+      - max_connections=500          # room for several silos × MaxPoolSize=128
+      - -c
+      - shared_buffers=2GB
+      - -c
+      - effective_cache_size=6GB
+      - -c
+      - wal_buffers=64MB
+      - -c
+      - max_wal_size=8GB             # fewer, larger checkpoints → no mid-run stalls
+      - -c
+      - min_wal_size=2GB
+      - -c
+      - checkpoint_timeout=20min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_worker_processes=16      # match the 16 hardware threads
     ports:
       - "5432:5432"
     volumes:
