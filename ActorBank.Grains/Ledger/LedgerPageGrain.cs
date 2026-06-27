@@ -16,8 +16,12 @@ public sealed class LedgerPageGrain : Grain, ILedgerPageGrain
         _page = page;
     }
 
-    public Task Append(TransactionRecord entry) =>
-        _page.PerformUpdate(s => s.Entries.Add(entry));
+    public Task Write(IReadOnlyList<TransactionRecord> entries) =>
+        _page.PerformUpdate(s =>
+        {
+            s.Entries.Clear();
+            s.Entries.AddRange(entries);
+        });
 
     public Task<List<TransactionRecord>> Read() =>
         _page.PerformRead(s => new List<TransactionRecord>(s.Entries));

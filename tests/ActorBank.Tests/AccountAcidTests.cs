@@ -128,6 +128,30 @@ public sealed class AccountAcidTests : IClassFixture<ClusterFixture>
         Assert.Equal("d130", recent.Transactions[^1].Description);
     }
 
+    [Theory]
+    [InlineData(127)] // current page not yet flushed
+    [InlineData(128)] // exactly one full page → flushed, current page empty
+    [InlineData(129)] // one flushed page + one entry in the current page
+    [InlineData(256)] // two full pages flushed
+    public async Task Ledger_is_correct_across_page_boundaries(int n)
+    {
+        var id = NewId();
+        await OpenAsync(id, 0m);
+        var account = Account(id);
+        for (var i = 1; i <= n; i++) await account.Deposit(1m, $"d{i}");
+
+        Assert.Equal((decimal)n, await BalanceAsync(id));
+
+        var full = await account.GetStatement(n + 100);
+        Assert.Equal(n, full.Transactions.Count);
+        Assert.Equal("d1", full.Transactions[0].Description);
+        Assert.Equal($"d{n}", full.Transactions[^1].Description);
+
+        var recent = await account.GetStatement(50);
+        Assert.Equal(Math.Min(50, n), recent.Transactions.Count);
+        Assert.Equal($"d{n}", recent.Transactions[^1].Description);
+    }
+
     [Fact]
     public async Task Apply_interest_credits_and_records_an_entry()
     {

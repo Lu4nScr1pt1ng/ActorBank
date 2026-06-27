@@ -3,10 +3,11 @@ using Microsoft.Extensions.Logging;
 namespace ActorBank.Grains.Accounts;
 
 /// <summary>
-/// Virtual-actor implementation of a bank account. The balance lives in a tiny transactional
-/// state; the history lives in append-only <see cref="ILedgerPageGrain"/> pages. Both are updated
-/// inside one Orleans transaction, so a transfer across accounts — and its ledger entries — are
-/// fully ACID, while the hot path never serializes the growing history.
+/// Virtual-actor implementation of a bank account. The balance <b>and the current ledger page</b>
+/// live together in one tiny transactional state, so a deposit/withdrawal is a single-participant
+/// transaction and a transfer enlists just the two accounts. When a page fills it is flushed to an
+/// append-only <see cref="ILedgerPageGrain"/> archive — inside the same transaction — so history is
+/// still bounded per write and a rolled-back operation never leaves a phantom entry.
 /// </summary>
 public sealed class AccountGrain : Grain, IAccountGrain
 {
@@ -36,13 +37,11 @@ public sealed class AccountGrain : Grain, IAccountGrain
             s.IsOpen = true;
             s.Owner = ownerName;
             return openingDeposit > 0
-                ? ApplyDelta(s, +openingDeposit)
-                : (Index: -1L, Balance: s.Balance);
+                ? ApplyEntry(s, +openingDeposit, TransactionType.OpeningDeposit, openingDeposit, "Opening deposit")
+                : NoMove(s.Balance);
         });
 
-        if (move.Index >= 0)
-            await AppendLedger(move.Index, TransactionType.OpeningDeposit, openingDeposit, move.Balance, "Opening deposit");
-
+        await FlushIfNeeded(move);
         AccountGrainLog.AccountOpened(_logger, AccountId, ownerName);
         return await GetStatement();
     }
@@ -53,10 +52,10 @@ public sealed class AccountGrain : Grain, IAccountGrain
         var move = await _account.PerformUpdate(s =>
         {
             EnsureOpen(s);
-            return ApplyDelta(s, +amount);
+            return ApplyEntry(s, +amount, TransactionType.Deposit, amount, description ?? "Deposit");
         });
 
-        await AppendLedger(move.Index, TransactionType.Deposit, amount, move.Balance, description ?? "Deposit");
+        await FlushIfNeeded(move);
         return move.Balance;
     }
 
@@ -68,10 +67,10 @@ public sealed class AccountGrain : Grain, IAccountGrain
             EnsureOpen(s);
             if (amount > s.Balance)
                 throw new InsufficientFundsException(amount, s.Balance);
-            return ApplyDelta(s, -amount);
+            return ApplyEntry(s, -amount, TransactionType.Withdrawal, amount, description ?? "Withdrawal");
         });
 
-        await AppendLedger(move.Index, TransactionType.Withdrawal, amount, move.Balance, description ?? "Withdrawal");
+        await FlushIfNeeded(move);
         return move.Balance;
     }
 
@@ -83,10 +82,10 @@ public sealed class AccountGrain : Grain, IAccountGrain
             EnsureOpen(s);
             if (amount > s.Balance)
                 throw new InsufficientFundsException(amount, s.Balance);
-            return ApplyDelta(s, -amount);
+            return ApplyEntry(s, -amount, TransactionType.TransferOut, amount, description ?? $"Transfer to {toAccountId}");
         });
-        await AppendLedger(move.Index, TransactionType.TransferOut, amount, move.Balance,
-            description ?? $"Transfer to {toAccountId}");
+
+        await FlushIfNeeded(move);
     }
 
     public async Task AcceptTransfer(string fromAccountId, decimal amount, string? description = null)
@@ -95,10 +94,10 @@ public sealed class AccountGrain : Grain, IAccountGrain
         var move = await _account.PerformUpdate(s =>
         {
             EnsureOpen(s);
-            return ApplyDelta(s, +amount);
+            return ApplyEntry(s, +amount, TransactionType.TransferIn, amount, description ?? $"Transfer from {fromAccountId}");
         });
 
-        await AppendLedger(move.Index, TransactionType.TransferIn, amount, move.Balance, description ?? $"Transfer from {fromAccountId}");
+        await FlushIfNeeded(move);
     }
 
     public async Task<decimal> ApplyInterest(decimal ratePercent)
@@ -106,21 +105,16 @@ public sealed class AccountGrain : Grain, IAccountGrain
         var move = await _account.PerformUpdate(s =>
         {
             if (!s.IsOpen || s.Balance <= 0 || ratePercent <= 0)
-                return (Index: -1L, Balance: s.Balance, Interest: 0m);
+                return NoMove(s.Balance);
 
             var interest = decimal.Round(s.Balance * ratePercent / 100m, 2, MidpointRounding.ToEven);
             if (interest <= 0)
-                return (Index: -1L, Balance: s.Balance, Interest: 0m);
+                return NoMove(s.Balance);
 
-            s.Balance += interest;
-            var index = s.LedgerCount;
-            s.LedgerCount++;
-            return (Index: index, Balance: s.Balance, Interest: interest);
+            return ApplyEntry(s, +interest, TransactionType.Interest, interest, "Interest");
         });
 
-        if (move.Index >= 0)
-            await AppendLedger(move.Index, TransactionType.Interest, move.Interest, move.Balance, "Interest");
-
+        await FlushIfNeeded(move);
         return move.Balance;
     }
 
@@ -136,50 +130,83 @@ public sealed class AccountGrain : Grain, IAccountGrain
         var snapshot = await _account.PerformRead(s =>
         {
             EnsureOpen(s);
-            return (s.Owner, s.Balance, s.LedgerCount);
+            return (s.Owner, s.Balance, s.LedgerCount, CurrentPage: s.CurrentPage.ToList());
         });
 
-        var entries = await ReadRecentEntries(snapshot.LedgerCount, maxTransactions);
+        var entries = await ReadRecentEntries(snapshot.LedgerCount, snapshot.CurrentPage, maxTransactions);
         return new AccountStatement(AccountId, snapshot.Owner, snapshot.Balance, entries);
     }
 
     // --- helpers ---------------------------------------------------------
 
-    /// <summary>Applies a balance delta and reserves the next ledger index. Caller appends the entry.</summary>
-    private static (long Index, decimal Balance) ApplyDelta(AccountState s, decimal delta)
+    // The state-update result: new balance, plus a completed page to flush (if any). A value tuple,
+    // because Orleans deep-copies whatever PerformUpdate returns and has built-in tuple/List copiers.
+    private static (decimal Balance, List<TransactionRecord>? FlushPage, long FlushPageNum) NoMove(decimal balance) =>
+        (balance, null, -1L);
+
+    /// <summary>
+    /// Applies a balance delta, appends the matching ledger entry to the in-state current page, and —
+    /// if that page is now full — detaches it for the caller to flush to an archive grain (in the same
+    /// transaction). Runs inside <c>PerformUpdate</c>, so it must stay synchronous and side-effect-free
+    /// beyond the state it is handed.
+    /// </summary>
+    private static (decimal Balance, List<TransactionRecord>? FlushPage, long FlushPageNum) ApplyEntry(
+        AccountState s, decimal delta, TransactionType type, decimal amount, string description)
     {
         s.Balance += delta;
         var index = s.LedgerCount;
         s.LedgerCount++;
-        return (index, s.Balance);
+        s.CurrentPage.Add(new TransactionRecord(DateTimeOffset.UtcNow, type, amount, s.Balance, description));
+
+        if (s.CurrentPage.Count < LedgerPaging.PageSize)
+            return NoMove(s.Balance);
+
+        // Page complete: detach it for archival and start a fresh current page.
+        var completed = s.CurrentPage;
+        s.CurrentPage = [];
+        return (s.Balance, completed, LedgerPaging.PageOf(index));
     }
 
-    private Task AppendLedger(long entryIndex, TransactionType type, decimal amount, decimal balanceAfter, string description)
+    /// <summary>Flushes a completed page to its archive grain, joining the caller's transaction.</summary>
+    private Task FlushIfNeeded((decimal Balance, List<TransactionRecord>? FlushPage, long FlushPageNum) move)
     {
-        var entry = new TransactionRecord(DateTimeOffset.UtcNow, type, amount, balanceAfter, description);
-        var pageKey = LedgerPaging.PageKey(AccountId, LedgerPaging.PageOf(entryIndex));
-        return GrainFactory.GetGrain<ILedgerPageGrain>(pageKey).Append(entry);
+        if (move.FlushPage is null)
+            return Task.CompletedTask;
+
+        var pageKey = LedgerPaging.PageKey(AccountId, move.FlushPageNum);
+        return GrainFactory.GetGrain<ILedgerPageGrain>(pageKey).Write(move.FlushPage);
     }
 
-    /// <summary>Reads the most recent <paramref name="max"/> entries, touching only the pages that hold them.</summary>
-    private async Task<IReadOnlyList<TransactionRecord>> ReadRecentEntries(long count, int max)
+    /// <summary>
+    /// Reads the most recent <paramref name="max"/> entries. The newest live in the in-state
+    /// <paramref name="currentPage"/>; older ones are read from the archive pages that hold them.
+    /// </summary>
+    private async Task<IReadOnlyList<TransactionRecord>> ReadRecentEntries(
+        long count, IReadOnlyList<TransactionRecord> currentPage, int max)
     {
         if (count == 0 || max <= 0)
             return [];
 
         var take = (int)Math.Min(count, max);
-        var firstIndex = count - take;
-        var firstPage = LedgerPaging.PageOf(firstIndex);
-        var lastPage = LedgerPaging.PageOf(count - 1);
+        var firstIndex = count - take;                       // oldest index we need
+        var flushedPages = count / LedgerPaging.PageSize;    // pages now in archive grains
+        var currentPageStart = flushedPages * LedgerPaging.PageSize;
 
+        // Fast path: the whole window is in the in-state current page — no archive reads.
+        if (firstIndex >= currentPageStart)
+            return currentPage.Skip((int)(firstIndex - currentPageStart)).ToList();
+
+        // Otherwise pull the archive pages [PageOf(firstIndex) .. flushedPages-1], then the current page.
+        var firstPage = LedgerPaging.PageOf(firstIndex);
         var result = new List<TransactionRecord>(take);
-        for (var page = firstPage; page <= lastPage; page++)
+        for (var page = firstPage; page < flushedPages; page++)
         {
             var pageEntries = await GrainFactory.GetGrain<ILedgerPageGrain>(LedgerPaging.PageKey(AccountId, page)).Read();
             result.AddRange(pageEntries);
         }
+        result.AddRange(currentPage);
 
-        // Trim the entries before firstIndex that share the first page.
+        // Trim the entries before firstIndex that share the first archive page.
         var leading = (int)(firstIndex - firstPage * LedgerPaging.PageSize);
         if (leading > 0)
             result.RemoveRange(0, Math.Min(leading, result.Count));
