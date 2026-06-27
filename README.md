@@ -492,18 +492,19 @@ Net: a billion/day is a **sharding-into-cells** problem plus **moving reads off 
 behavior-preserving — not a "buy a bigger machine" problem. Every layer has an independent horizontal
 lever; the only thing that *must* serialize is a single account near a zero balance.
 
-**Measured impact of levers 1 & 2 (implemented).** On the same box, levers 1 and 2 raised single-cell
-throughput from the baseline above by **~1.7–1.9×** with no behaviour change:
+**Measured impact of levers 1 & 2 (implemented).** On the same box, with no behaviour change:
 
 | Workload | Before | After (levers 1 + 2) |
 |---|---|---|
-| 50/50 read-write mix | ~2,100 req/s · p95 141 ms | **~3,640 req/s · p95 63 ms** |
-| read latency (avg, in the mix) | ~32 ms | **~11 ms** (served from the read model) |
-| read-only | ~2,000 req/s | **~3,770 req/s** |
+| **read-only** (read-heavy) | ~2,100 req/s | **~11,800 req/s · ~0 commits/read** |
+| 50/50 read-write mix | ~2,100 req/s · p95 141 ms | **~3,100 req/s · p95 80 ms** |
+| read latency (avg, in the mix) | ~32 ms | **~13 ms** (served from the read model) |
 
-Co-locating the ledger (lever 2) cut writes to one transaction participant, and the read model
-(lever 1) takes balance reads off the coordinator once it is warmed by writes. Cells (lever 3) remain
-the lever for going *past* one cell.
+The read model (lever 1) takes balance reads **completely** off the transaction coordinator — a
+read-only workload commits ≈0 rows per read and **already clears the 11,600 req/s target on a single
+cell**. Co-locating the ledger (lever 2) makes writes single-participant, lifting the still-write-bound
+50/50 mix ~1.5×. So a *read-heavy* bank (most traffic is balance/statement checks) is already there on
+one cell; the *write* half is what cells (lever 3) scale past one cell.
 
 ### 7.7 The irreducible floors (honest limits)
 

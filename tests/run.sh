@@ -12,6 +12,6 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 exec docker run --rm -i --network host \
   -e BASE_URL="${BASE_URL:-http://localhost:8080}" \
   -e ACCOUNTS="${ACCOUNTS:-}" -e INITIAL="${INITIAL:-}" -e VUS="${VUS:-}" -e DURATION="${DURATION:-}" \
-  -e POOL="${POOL:-}" -e PEAK="${PEAK:-}" \
+  -e POOL="${POOL:-}" -e PEAK="${PEAK:-}" -e WRITE_RATIO="${WRITE_RATIO:-}" \
   -v "$DIR/k6:/scripts:ro" \
   grafana/k6 run "/scripts/$SCRIPT"
