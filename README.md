@@ -20,9 +20,36 @@ WhatsApp-class throughput.
 4. [How ActorBank uses the actor model](#4-how-actorbank-uses-the-actor-model)
 5. [The machinery up close](#5-the-machinery-up-close)
 6. [What it does — functionality & API](#6-what-it-does--functionality--api)
-7. [How it scales — from one box to a billion messages](#7-how-it-scales--from-one-box-to-a-billion-messages)
+7. [How it scales](#7-how-it-scales)
 8. [Project layout](#8-project-layout)
 9. [Run it](#9-run-it) · [Testing](#10-testing) · [Configuration](#11-configuration) · [Roadmap](#12-roadmap) · [Requirements](#13-requirements)
+
+· [Key concepts (glossary)](#key-concepts-glossary) · [FAQ](#frequently-asked-questions)
+
+---
+
+## Key concepts (glossary)
+
+A one-line definition of every term used in this document. The sections that follow expand on each.
+
+| Term | What it is |
+|---|---|
+| **Actor** | A unit of computation with **private state**, **behavior**, and a **mailbox**. It shares no memory and processes **one message at a time**, so its state can never be touched concurrently — no locks, no races. |
+| **Grain** | Orleans' **virtual actor** — the building block of ActorBank. Identified by *type + key* (e.g. `AccountGrain` with key `"alice"`), it conceptually always exists, is activated on demand, deactivated when idle, and runs single-threaded. You call it by identity; the runtime finds it. |
+| **Activation** | The live, in-memory instance of a grain on some silo. Orleans guarantees **exactly one activation per grain id** across the whole cluster — that's what makes "one message at a time" hold cluster-wide. |
+| **Account grain** | The `AccountGrain` for one account — *the account itself as an actor*. Its single-threaded turns are why a balance is updated correctly without locks. |
+| **Ledger page** | A bounded chunk (128 entries) of an account's transaction history. The **current** page lives inside the account grain; once full it is flushed to an archive `LedgerPageGrain`. Keeps writes O(1) regardless of history length. |
+| **Read model** | A **non-transactional projection** of an account's balance, updated *after* each commit. `GetBalance` reads it without opening a transaction, so the read-heavy majority of traffic stays cheap. The authoritative balance still lives on the account grain. |
+| **Silo** | One server process that hosts many grains. Each ActorBank process is a silo **and** the web API, co-hosted. |
+| **Cluster** | A set of silos that share a `ClusterId` and a backing database; they discover each other and coordinate (placement, transactions). Adding silos to a cluster adds compute. |
+| **Shard / sharding** | Splitting grain **storage** across several databases so writes don't all land on one — each grain's state goes to a database chosen by a **stable hash** of its key. It stays a single cluster, so transfers are still ACID. |
+| **Stable hash** | A deterministic key→shard mapping (FNV-1a here) that is identical across processes and restarts — unlike `string.GetHashCode`, which is randomized per process. |
+| **Hot (shared) account** | A single account that *many* parties hit at once — e.g. a central **clearing/settlement** account. Because one account is single-threaded, it's a serialization point; the fix is **escrow stripes**. |
+| **Escrow stripes** | Splitting a hot account into *N* sub-balance grains, each holding a slice of the money, so credits and debits run in parallel — coordinating only when the balance nears zero. |
+| **Transaction (2PC)** | Orleans' **distributed ACID transaction**: it makes a change across several grains commit or roll back together, coordinated **in the cluster** (two-phase commit), not by the database. A transfer is one such transaction over two accounts. |
+| **Transactional vs persistent state** | `ITransactionalState<T>` participates in 2PC (accounts, ledger pages); `IPersistentState<T>` is a cheaper single-grain write (credentials, read model, interest sweep). |
+| **Reminder** | A **durable**, persisted scheduled callback (survives restarts) — used for interest. (Orleans **timers** are the cheaper, in-memory, non-durable alternative.) |
+| **Stateless edge** | The API / load-balancer layer. It holds no state, so any replica can serve any request; the **stateful** grains live in the silos behind it. |
 
 ---
 
@@ -126,28 +153,30 @@ to make a specific correctness property *free*.
 *Key = account id (the owner's username, e.g. `"alice"`).* The heart of the system. Because Orleans
 serializes every message to an account, deposits, withdrawals, and transfer legs are applied one at a
 time — **no lost updates, ever**, with no locks in the code. Its transactional state is deliberately
-tiny and **constant-size**:
+small and **bounded** — a few scalar fields plus the current ledger page (at most 128 entries):
 
 ```csharp
 [GenerateSerializer]
 public sealed class AccountState
 {
-    [Id(0)] public bool   IsOpen;
-    [Id(1)] public string Owner;
+    [Id(0)] public bool    IsOpen;
+    [Id(1)] public string  Owner;
     [Id(2)] public decimal Balance;
-    [Id(3)] public long   LedgerCount;   // history lives elsewhere (see below)
+    [Id(3)] public long    LedgerCount;                 // total entries ever written
+    [Id(4)] public List<TransactionRecord> CurrentPage; // latest ≤128-entry page; older pages archived
 }
 ```
 
-The money path only ever serializes those four fields, so it stays O(1) no matter how much history an
-account accumulates.
+The money path serializes only this bounded state, so a write stays O(1) no matter how much history
+an account accumulates — completed pages are flushed out to archive grains (next).
 
-### `LedgerPageGrain` — append-only history, sharded into actors
-*Key = `"{accountId}/{page}"`, 128 entries per page.* A naïve account would keep its whole transaction
-list in state — but then every write re-serializes a list that grows forever (O(n) per write). Instead,
-history is split into bounded **page actors**. An append rewrites only the *current* page, so write
-cost stays bounded for the life of the account. Each append commits **inside the same transaction** as
-the balance change that caused it, so a rolled-back transfer can never leave a phantom ledger entry.
+### `LedgerPageGrain` — archived history, page by page
+*Key = `"{accountId}/{page}"`, 128 entries per page.* History is append-only and split into bounded
+pages so it never grows the account's hot state. The *current* page lives inside the account grain
+itself — so a new entry commits together with the balance as a **single participant** — and once it
+fills, it is flushed (in the same transaction) to a `LedgerPageGrain` that holds that completed page
+forever. A write stays bounded no matter how long the account has been active, and a rolled-back
+operation can never leave a phantom entry.
 
 ### `CredentialGrain` — one actor per user
 *Key = username.* Holds a salted **PBKDF2-SHA256** password hash bound to an account id, used to issue
@@ -160,22 +189,28 @@ reminders), a small fixed pool of sweep coordinators each own **one** reminder. 
 grain credits every account enrolled in its shard by calling `AccountGrain.ApplyInterest`. Accounts map
 to shards by a stable FNV-1a hash (`InterestSharding`).
 
+### `AccountReadModelGrain` — a cheap, non-transactional balance
+*Key = account id.* A projection of the balance, updated *after* each committed operation and read
+**without** opening a transaction — so balance checks, the bulk of a bank's traffic, never touch the
+transaction coordinator. The authoritative balance still lives on the `AccountGrain` (and still backs
+the overdraft check); the read model is eventually consistent, fresh within the publish lag.
+
 ### Turns, transactions, and deadlock-freedom
 
 - **One turn at a time.** Every grain method is a *turn*. While a turn `await`s an outgoing call, the
   grain does not start another message — its state can't be observed half-updated.
 - **ACID across grains.** Account methods are `[Transaction(TransactionOption.CreateOrJoin)]` over
-  `ITransactionalState<T>`. A deposit enlists the account *and* its current ledger page in one
-  two-phase commit; a transfer enlists up to four grains (both accounts + both pages). Either
-  everything commits or everything rolls back — **no manual compensation logic**.
+  `ITransactionalState<T>`. A deposit or withdrawal commits as a **single participant** (balance and
+  ledger entry live in the account's own state); a transfer enlists **two** accounts. Either everything
+  commits or everything rolls back — **no manual compensation logic**.
 - **Transfers are orchestrated by the API, not by grains.** `AccountEndpoints` opens one transaction
   via `ITransactionClient` and calls the two legs (`DebitForTransfer` + `AcceptTransfer`) itself, in a
   **fixed account-id order**. Account grains never call each other.
 
   > **Why the ordering matters.** If account grains called each other directly, two opposing transfers
-  > (A→B and B→A) could each hold their own turn while waiting on the other — a classic turn-based
-  > **deadlock**, which a load test actually caught. Issuing both legs from the coordinator in a
-  > consistent id order means locks are always acquired in the same direction, so no cycle can form.
+  > (A→B and B→A) could each hold their turn while waiting on the other — a turn-based **deadlock**.
+  > Composing both legs from the coordinator in a consistent id order means locks are always acquired
+  > in the same direction, so no cycle can form.
 
 - **A grain never calls itself.** That's why scheduled interest lives on a *separate* grain
   (`InterestSweepGrain`) that calls the account — a grain awaiting a call to its own identity would
@@ -193,14 +228,10 @@ A transfer, as one ACID transaction (2PC), composed by the API:
                               ▼                        ▼
                    ┌────────────────────┐    ┌────────────────────┐
                    │ AccountGrain alice │    │  AccountGrain bob  │
-                   │    Balance -300    │    │    Balance +300    │
-                   └─────────┬──────────┘    └─────────┬──────────┘
-                             ▼                          ▼
-                   ┌────────────────────┐    ┌────────────────────┐
-                   │  LedgerPageGrain   │    │  LedgerPageGrain   │
-                   │  alice/3  +entry   │    │  bob/7   +entry    │
+                   │  -300 + ledger     │    │  +300 + ledger     │
+                   │  entry (one state) │    │  entry (one state) │
                    └────────────────────┘    └────────────────────┘
-            All four enlisted in ONE transaction → commit together or roll back together.
+            Both accounts enlisted in ONE transaction → commit together or roll back together.
 ```
 
 ---
@@ -226,18 +257,19 @@ consequences worth internalising:
 - **It's why a self-call deadlocks.** If `AccountGrain` awaited a call to its own id, the second turn
   could never start until the first finished, and the first is waiting on the second. Hence the
   separate `InterestSweepGrain`.
-- **It's why reads aren't free.** `GetStatement` awaits reads of one or more `LedgerPageGrain`s; for
-  the duration, the account activation is busy and a concurrent `Deposit` to the same account *queues
-  behind it*. Reads and writes to one account are serialized against each other — fine per-account,
-  but the reason a read-heavy hot account wants the read-model in §7.
+- **It's why the balance has a read model.** A `GetStatement` reads the account's pages, so while it
+  runs a concurrent `Deposit` to the same account *queues behind it* — reads and writes to one account
+  serialize. Balance checks are far more frequent, so `GetBalance` is served from a separate,
+  non-transactional **read model** (§7.3) — off the activation entirely — instead of competing for the
+  account's turns.
 
 ### Two flavours of persistence — and why each grain picks one
 Orleans separates *storage* from *consistency*, and ActorBank uses both deliberately:
 
 | Grain | State holder | Why |
 |---|---|---|
-| `AccountGrain`, `LedgerPageGrain` | `ITransactionalState<T>` | They participate in **multi-grain ACID** transactions (transfers, balance+ledger). Transactional state is what lets Orleans run two-phase commit across them. |
-| `CredentialGrain`, `InterestSweepGrain` | `IPersistentState<T>` | They only ever touch **their own** state. Plain persistent storage (`WriteStateAsync`) is cheaper — no transaction machinery needed. |
+| `AccountGrain`, `LedgerPageGrain` | `ITransactionalState<T>` | They participate in **multi-grain ACID** transactions (a transfer spans two accounts; a page flush spans an account and its archive page). Transactional state is what lets Orleans run two-phase commit across them. |
+| `CredentialGrain`, `AccountReadModelGrain`, `InterestSweepGrain` | `IPersistentState<T>` | They only ever touch **their own** state. Plain persistent storage (`WriteStateAsync`) is cheaper — no transaction machinery needed. |
 
 The lesson: don't pay for distributed transactions where a single-grain write is correct. Reach for
 `ITransactionalState<T>` only when an operation must be atomic across *several* grains.
@@ -248,9 +280,9 @@ transaction coordinator (here the API via `ITransactionClient`, or a `TestTransf
 enlists the participating grains, each prepares its transactional state, and the commit is agreed
 in-cluster before anything is durably written. `TransactionOption.CreateOrJoin` means each account
 method *joins* an ambient transaction if one exists, or *creates* one if called standalone — so the
-same `Deposit` method is correct whether called directly or as a leg of a transfer. This is why the
-transaction can span grains whose state lives in *different* databases (the basis for storage sharding
-in §7).
+same `Deposit` method is correct whether called directly or as a leg of a transfer. Because the
+coordinator lives in the cluster, a transaction can span grains whose state sits in *different*
+databases — which is what lets you shard storage across many databases while keeping transfers ACID (§7.4).
 
 ### Reminders vs timers
 Scheduled interest must survive restarts, so it uses Orleans **reminders** — durable, persisted to the
@@ -342,185 +374,256 @@ curl -s $B/accounts/alice/statement -H "authorization: Bearer $TOKEN"
 A transfer to a non-existent / unopened account returns `404` **and the debit is rolled back** — the
 transaction guarantees both legs commit together or not at all.
 
-### The ledger trade-off (consistency vs. participants)
+### The ledger is as consistent as the money
 
-Committing ledger appends *inside* the balance transaction enlists more participants in the 2PC (a
-deposit = account + its page; a transfer = up to four grains). That is the deliberate price of a
-**strongly consistent audit log**: a rolled-back transfer can never leave a phantom entry, and a
-committed one is always recorded. The only lever to reduce participants would be an *eventually
-consistent* (post-commit) ledger — which trades away audit atomicity, something a bank should not do.
+Each ledger entry commits *inside the same transaction* as the balance change that produced it, so the
+audit log is exactly as consistent as the money: a rolled-back transfer can never leave a phantom
+entry, and a committed one is always recorded. Because the current page lives in the account's own
+state, that guarantee costs almost nothing on the hot path — a deposit or withdrawal is a single
+transaction participant, and only a transfer spans two accounts.
 
 ---
 
-## 7. How it scales — from one box to a billion messages
+## 7. How it scales
 
-The actor model gives ActorBank an unusually clean scaling story, *and* a small set of honest ceilings.
-This section walks the whole picture: the model, a layer-by-layer bottleneck map, the concrete lever
-for each layer, a back-of-envelope to a billion operations/day, and the floors you genuinely cannot
-cross.
+You scale ActorBank the way you scale anything on Kubernetes: **one cluster, and you add silos —
+instances (pods) across many machines, each a process full of grains.** Orleans spreads the grains
+across the silos and rebalances them automatically; to grow, you add silos. It's the same shape that
+let **WhatsApp** carry tens of billions of messages a day on Erlang. For a bank, the independent unit
+is the **account**.
 
-### 7.1 The scaling model
+### 7.1 The unit of parallelism is the account
 
-- **The account is the unit of parallelism.** Two different accounts are two different actors on
-  (potentially) two different silos — they never contend. A workload of *N* independent accounts is
-  *N*-way parallel. This is the same property that made BEAM/WhatsApp scale: independent per-entity
-  actors are embarrassingly parallel.
-- **The edge is stateless; the silos are stateful.** Add API capacity by adding replicas behind nginx;
-  add grain capacity by adding silos to the cluster. They scale independently because they're the same
-  process today but separable tomorrow (you can split "frontend" silos from "grain" silos).
-- **Idle accounts cost nothing.** A virtual actor that isn't being used is deactivated; only *active*
-  accounts occupy memory. A bank with 100M accounts but 50k active at any instant pays for the 50k —
-  exactly how WhatsApp kept millions of *possible* sessions cheap.
+Two different accounts are two different actors, placed (potentially) on different silos; they never
+touch each other's state, so a workload of *N* active accounts is *N*-way parallel. The **edge is
+stateless** — any API replica behind the load balancer serves any request — while the grains are
+**stateful**, placed across the silos. And **idle accounts cost nothing**: an actor not in use is
+deactivated, so a bank with 100M accounts but 50k active at once pays RAM for only the 50k.
 
-### 7.2 Where the work actually serializes (bottleneck map)
+### 7.2 The native path: one cluster, add silos
 
-| Layer | What can serialize / saturate | Lever to scale it | Status |
+A **cluster** is a set of silos sharing a `ClusterId` and a backing store; they find each other through
+the membership table. **You scale it by adding silos — exactly like scaling a Kubernetes Deployment:**
+each silo is a pod, the scheduler spreads pods across machines, and Orleans **rebalances grain
+activations across the new silos automatically.** You never place or route grains by hand — you call
+them by identity and the cluster finds them.
+
+```
+   one Orleans cluster  —  scale out by adding silo pods (kubectl scale / HPA)
+   ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+   │  silo 1  │ │  silo 2  │ │  silo 3  │ │  silo N  │   each: a process full of grains,
+   │  (pod)   │ │  (pod)   │ │  (pod)   │ │  (pod)   │   scheduled onto any machine
+   └──────────┘ └──────────┘ └──────────┘ └──────────┘
+        grains are spread + rebalanced across all silos, automatically
+```
+
+Today that's `docker compose up --scale app=N`; in production it's a Kubernetes Deployment with
+`Microsoft.Orleans.Clustering.Kubernetes`. **A single cluster runs to hundreds of silos** — adding
+compute is transparent, and it is the first (and usually the only) scaling move you need.
+
+> **A silo is a *process*, not a machine.** Each silo is one instance of the app (in ActorBank, the API
+> and the Orleans server co-hosted), normally one per pod; k8s schedules those pods onto nodes
+> (machines). Pods on *different* machines still join the *same* Orleans cluster — they find each other
+> through the shared membership table and connect pod-to-pod (each advertising its pod IP). So **the
+> Orleans cluster (a set of silos) is not the same thing as the Kubernetes cluster (a set of
+> machines)** — you run the former as pods on top of the latter.
+
+> **What adding pods does and doesn't scale.** Pods add **compute**, so they scale the **read half**
+> (balance/statement traffic, served from the read model) and grain-call capacity. They do **not** scale
+> **writes** — every write commits to PostgreSQL, and that database is the write ceiling, not CPU. To
+> scale writes you shard the **storage** across more databases (§7.4) — still one cluster. So: *pods for
+> compute and reads; sharded storage for writes; both under one cluster.*
+
+### 7.3 What stays cheap as the bank grows
+
+The grain design keeps the per-operation cost flat no matter how big the bank or how long an account
+has lived:
+
+- **Small, bounded hot state.** An account's transactional state is a few scalar fields plus its current
+  ledger page (≤128 entries); the money path never serializes a growing history.
+- **Single-participant writes.** A deposit or withdrawal appends its ledger entry into the account's
+  own state, so it commits as one participant; only a transfer spans two accounts. Completed ledger
+  pages are flushed to append-only archive grains, so a write stays bounded for the life of the account.
+- **Reads off the money path.** Balance reads are served from a non-transactional projection (the
+  read model), updated after each commit — so the read-heavy majority of a bank's traffic (balance
+  checks, statements) never touches the transaction coordinator and stays fast under any load.
+- **A fixed reminder footprint.** Interest runs on a small, fixed pool of sweep coordinators rather
+  than one reminder per account, so scheduled work doesn't grow with the customer base.
+
+### 7.4 Scaling the database (writes)
+
+Adding silos scales compute, but the first thing to actually saturate is the **database** — every
+commit lands in one Postgres, and a single primary is the write ceiling (below it, the CPU sits idle).
+Two traps to clear first: **read replicas don't help** — they're read-only, so every write still hits
+the one primary — and **a single primary can't be write-scaled by adding nodes**. You scale writes in
+two moves, cheapest first.
+
+**1. Scale up and tune the one primary.** A bigger instance (cores, RAM, fast NVMe / high IOPS) plus
+tuning — WAL and checkpoint settings, group commit, and **PgBouncer** connection pooling so many silos
+share few connections — takes a single Postgres to *tens of thousands* of writes/sec. Durability stays
+on (a bank can't trade `synchronous_commit`), so there's a ceiling, but it's high and most systems stop
+here.
+
+**2. Shard the grain storage across N independent Postgres.** Grain storage is a key-value store
+addressed by grain id, with no cross-row joins on the write path — ideal for sharding. A custom
+`IGrainStorage` provider routes each grain's state to one of *N* primaries by a **stable hash** of its
+key, so aggregate write throughput is *N* × per-primary, without bound. How you shard it under Orleans
+is what matters:
+
+- **Keep each shard a plain Postgres; let Orleans be the only coordinator.** A transfer's two accounts
+  may live on different primaries, but the 2PC across them is *Orleans'* job — each Postgres is just a
+  local-transaction participant. One coordinator, full ACID, no sagas, still one cluster.
+- **Don't put a distributed database (Citus, CockroachDB, …) under the transactional store.** Orleans
+  already does cross-grain 2PC; a distributed engine would run its *own* 2PC across its workers
+  underneath — two stacked coordinators on the money path — and Orleans' storage schema isn't built for
+  that distribution. (Those engines are the right tool for the **reporting** store, §12 — analytical,
+  cross-row queries with nothing stacked under them — not the write path.)
+- **Use logical-shard indirection so growth is cheap.** Hash into many fixed logical buckets (e.g.
+  1024) mapped onto the physical primaries; adding a primary remaps a few buckets instead of rehashing
+  everything.
+- **Replicate each shard for HA.** Sharding (throughput) and replication (durability/failover) are
+  orthogonal — give every primary a synchronous standby (Patroni/streaming).
+
+Result: write throughput grows with the number of primaries, transfers stay a single Orleans 2PC, and
+it is all still **one cluster**. More silos (§7.2) + sharded storage (here) + the read model (§7.3) take
+one cluster as far as you need — you never need a second cluster. *(Storage sharding is on the roadmap;
+today the cluster uses a single Postgres.)*
+
+### 7.5 Consistency: one account, one truth
+
+The natural worry: with many silos on many machines, won't two copies of an account drift apart? They
+can't — because within a cluster **an account is never copied.** Three guarantees enforce it:
+
+- **One activation, cluster-wide.** Orleans keeps a distributed **grain directory** mapping each active
+  account id to the *single* silo hosting it. Every request for `"alice"`, from any silo, routes to that
+  one activation, which processes one message at a time. Two silos can't hold different copies — there
+  is only ever one, so divergence is impossible *by construction*, not by syncing.
+- **The database is the source of truth.** An activation is a cache: it loads committed state when it
+  activates and persists on write. If a silo crashes, the account simply reactivates on another silo
+  from the latest committed state — nothing is lost.
+- **Membership prevents split-brain.** Silos agree, through the shared membership table, on exactly who
+  is alive; a silo that loses contact is evicted and stops serving rather than risk a duplicate
+  activation. That single membership view is the one piece that must stay centralized in a cluster.
+
+A transfer between two accounts is a single **Orleans transaction** — 2PC over the two grains — so both
+legs commit or both roll back, **even if their state lives on different storage shards** (§7.4). Strong,
+classic ACID, automatically.
+
+Two things are inherently serial — properties of an exact ledger, not flaws:
+
+- **A single account is single-threaded.** That *is* the correctness guarantee. A central "hot" account
+  everyone hits (a clearing/settlement account) is therefore a serialization point; you'd split it into
+  **escrow stripes** — *N* sub-balance grains taking credits and debits in parallel, coordinating only
+  when the balance nears zero (the one point where serialization is mathematically required).
+- **One membership view per cluster** (above).
+
+And the **read model** is eventually consistent — a balance read can be a few milliseconds stale — but
+the *authoritative* balance on the account grain is always single and exact, and the overdraft check
+always uses it. A stale read is not a desynced ledger.
+
+### 7.6 Worked example: a 100-billion-request-a-day bank
+
+Big-bank scale, worked end to end.
+
+**The target.** 100B requests/day is **~1.16M req/s** on average (100,000,000,000 ÷ 86,400). Real
+traffic peaks — payday, bill runs — so plan for a **5× daily peak ≈ 5.8M req/s**.
+
+**The mix makes it tractable.** A retail bank is overwhelmingly reads (balance checks, statements, app
+refreshes) versus payments. At a conservative **90 / 10**:
+
+- reads: ~**5.2M req/s** at peak — served from the **read model**, non-transactional and in-memory, so
+  the read-heavy 90% barely touches the expensive path;
+- writes: ~**580k req/s** at peak — single-participant ACID transactions.
+
+So 100B/day is not a "1.16M req/s" problem; it's a **~580k transactional-writes/s** problem — and that
+is a sharding problem.
+
+**Measured reference (this build).** Benchmarked on one **Ryzen 7 5700G (8c/16t), 32 GB**, running
+*everything together* — Postgres + two silos + the load generator — through the load balancer:
+
+| Workload | Throughput | Cost per op | |
 |---|---|---|---|
-| HTTP edge | CPU on token verify + JSON | add app replicas behind nginx; verification is already lock-free per-thread | ✅ done |
-| Compute (grains) | a silo's CPU/RAM | add silos; Orleans rebalances activations | ✅ done |
-| **One account** | a single activation is serial (incl. its reads) | **escrow-striped account** (§7.4) | 🔜 lever known |
-| **Storage** | every commit writes **one PostgreSQL** | **shard grain storage across N DBs** (§7.3) | 🔜 lever known |
-| Reminders | one durable reminder per account would flood | fixed pool of `InterestSweepGrain` shards | ✅ done |
-| Read load | reads also ride the transaction subsystem | **CQRS read model** (§7.5) | 🔜 lever known |
-| **Transactions** | **per-cluster 2PC coordination — the *measured* ceiling** (a few k ops/s, CPU idle) | fewer participants per op + **shard into independent cells** (§7.6) | 🔬 measured |
+| read-only | **~10,700 req/s** | ~0 DB commits/read | served entirely from the read model |
+| 90 / 10 (realistic) | **~7,300 req/s** | ~0.4 commits/op | the read model carries the read half |
+| 50 / 50 | **~3,100 req/s** | ~2 commits/op | |
+| write-only | **~2,000 writes/s** | ~4 commits/write | one single-participant 2PC write |
 
-The headline ceiling is **transaction coordination**: §7.6 shows a single cluster + single Postgres
-tops out at a few thousand transactional ops/sec *with the CPU almost idle*, because the limiter is
-2PC round-trips, not compute. Raising it means doing **fewer transactions per op** and **running more
-clusters**, not buying a bigger box.
+Two facts drive the whole design: a **read costs ≈0 transactions** (read model), and a **write costs
+~4 Postgres commits** (the two-phase commit). So the binding number is the **write rate**, set by the
+database — ~2,000 writes/s on this one shared desktop, while the read half rides along nearly for free.
 
-### 7.3 Scaling storage: shard grain state across N databases
+**Sizing the (single) cluster.** Writes are the binding constraint (~580k/s at peak). You meet it
+inside **one cluster**, on two axes:
 
-Today every transactional commit lands in one Postgres, so the cluster ultimately tops out at roughly
-one database. The lever is a **sharded grain-storage provider**: route each grain's state to one of
-*N* physical Postgres instances by a **stable hash of the grain key**, behind the same provider names
-the grains already bind to (`accountStore`, `ledgerStore`, `credentialStore`). Key design points:
+- **Silos for compute** — add silo pods (§7.2) until grain-call CPU is no longer the limit. The
+  read-heavy 90% is served from the read model, so this scales cheaply.
+- **Database shards for writes** — shard the grain storage (§7.4) across enough Postgres instances that
+  their combined write rate clears 580k/s:
+  - desktop-class Postgres (~2,000 writes/s each): 580,000 ÷ 2,000 ≈ **~290 shards**;
+  - production-class Postgres (~10k–20k writes/s each): 580,000 ÷ 10k–20k ≈ **~30–60 shards**.
 
-- **Stable hashing, not `string.GetHashCode`.** A grain must always map to the same shard across
-  processes and restarts (FNV-1a or similar), or its state would "move" on every boot.
-- **Co-locate an account with its own ledger pages.** Route on the account-id *prefix* (`"alice"` and
-  `"alice/3"` → same shard) so a single account's deposit is a **one-database commit**. Only
-  cross-account transfers between different shards become two-database commits — still ACID, because
-  Orleans coordinates the 2PC in-cluster regardless of which DB backs each grain (§5).
-- **Logical-shard indirection.** Hash into many fixed logical buckets (e.g. 1024), then map buckets →
-  physical DBs by range. Growing from 3 to 6 databases remaps ranges instead of rehashing every key.
-- **The control plane stays central.** Cluster **membership** and **reminders** need one global view,
-  so they live on a single small "control" DB. They're low-traffic bookkeeping, not the write path —
-  centralising them is a non-issue for throughput.
+Run at ~60–70% utilization with HA replicas → on the order of **40–80 production database shards** (a
+few hundred desktop-class ones) behind **one** cluster. These are real reference numbers; a production
+database isn't sharing a CPU with the silos and the load generator, so its true per-shard capacity is
+meaningfully higher. A transfer across shards is still a single Orleans 2PC — it remains one cluster.
 
-Result: write throughput scales with the number of shard databases — *provided* storage is the
-bottleneck. The benchmark in §7.6 shows that on this build the limiter is actually the per-cluster
-**transaction coordinator**, not the database, so sharding storage under one cluster helps only up to
-that coordinator's ceiling. Past it, you shard the whole *cluster* into cells (§7.6).
+**The rest of the footprint.**
 
-### 7.4 Scaling a hot account: escrow / striped balances
+- **Edge:** ~5.8M req/s of HTTP across a horizontally-scaled, **stateless** API / load-balancer tier
+  (token verification is mostly cache hits). At this scale you separate the edge from the grain silos.
+- **Storage:** grain storage sharded across the databases above, each with HA replicas — so a storage
+  incident is contained to one shard of customers, not the whole bank.
 
-A central account that *everyone* hits (a clearing or settlement account) is one activation = serial,
-no matter how many silos you add. Plain striping (split into N sub-balances, credits fan out) fixes
-*credits* but not *debits*, because a debit must check `amount <= balance`. The technique that wins
-**both** directions is the **escrow method** (O'Neil, 1986): split the account into *N* **stripe
-grains, each holding a real slice of the balance**.
+**Where ActorBank is on this path.** Today it runs as one cluster on a single Postgres, and the pieces
+that make a cluster efficient are already in place: account-as-actor with ACID transfers, the
+co-located ledger (single-participant writes), the balance read model (cheap reads), the sharded
+interest sweep, and post-quantum auth with a verification cache. Reaching 100B/day is **more of the
+same cluster, not a redesign** — add silos, shard the grain storage (§7.4), escrow-stripe the clearing
+accounts, and run the edge on Kubernetes (see the [Roadmap](#12-roadmap)).
 
-- **Credit** → pick a stripe, add locally. Parallel.
-- **Debit** → pick a stripe; if *that* stripe has enough, subtract locally. Parallel, zero coordination.
-- **Slow path** (rare): only when a stripe is too low does the operation run a coordinated transaction
-  across stripes to gather funds or genuinely reject.
+---
 
-So a well-funded hot account is fully parallel in both directions; it only serializes when the balance
-approaches zero — which is the one regime where serialization is *mathematically* required (you cannot
-let N actors independently spend the last dollar). Money stays exact (sum of stripes = true balance);
-no false overdrafts. Make it **opt-in per account** so normal accounts keep the simple single-grain
-model.
+## Frequently asked questions
 
-### 7.5 Scaling reads: a CQRS read model
+### A user opens an account that's been dormant for two years — does it time out?
 
-Because reads run *on* the account activation (§5), a read-heavy account makes reads and writes queue
-against each other. The lever is **CQRS**: have each committed transaction also publish to an
-eventually-consistent **read model** (a projection grain, cache, or relational table) that
-`GetBalance`/`GetStatement` serve from **without** touching the account's transactional state. Writes
-stay strongly consistent; reads get cheap and never block the money path. The cost is read staleness on
-the order of the projection lag — acceptable for statements, not for the overdraft check (which stays
-on the authoritative grain).
+No — it just **wakes up on first touch**, with a one-time cost of a few milliseconds. A grain is
+*virtual*: it always conceptually exists, so "dormant" means *not currently in memory*, **not deleted**
+— the account's state has been sitting in PostgreSQL the whole time. The first request **lazily
+reactivates** it: Orleans places the grain on a silo, the storage provider does **one primary-key read**
+to load its state, `OnActivateAsync` runs (ActorBank does nothing heavy there), and the call is
+answered. Every call after that hits RAM (sub-millisecond) until the account goes idle again (~2 h by
+default) and quietly deactivates.
 
-### 7.6 Scaling to a billion requests a day
+The age doesn't matter, and neither does table size — it's an **indexed point lookup**, the same speed
+at 80M rows as at 1,000. Idle accounts cost only disk, which is exactly what lets the bank hold 80M
+accounts while paying RAM for only the ~20M active at any instant. It would only be slow if the
+**database itself were overloaded** (a capacity problem, not a dormancy one), or if something woke
+*millions* of dormant accounts at once (a manageable burst of cheap reads, spread across the silos).
 
-A billion requests a day is ≈ **11,600 req/sec** on average, with real peaks 3–5× that. Here is the
-honest path, grounded in an actual benchmark of the current build (8-core/16-thread box, NVMe,
-single cluster + single Postgres, 50/50 read-write account ops through the load balancer):
+### Can I query all accounts directly in PostgreSQL?
 
-**What one cluster actually does (measured).**
+You can list account **ids** (the grain key is a column), but not their **data**. Orleans grain storage
+is a **key-value store** — balance and owner live inside a serialized payload, not queryable columns,
+and once storage is sharded they're spread across many databases. For real queries (`WHERE balance > …`,
+statements, analytics) you project account state into a **relational reporting store** fed by the event
+stream — the OLTP/reporting split on the [Roadmap](#12-roadmap). You address grains by identity; you
+don't query them.
 
-| Probe | Result | What it tells us |
-|---|---|---|
-| Bare `/` direct to a silo | **~100,000 req/s** | the .NET/Orleans HTTP layer is not the limit |
-| Bare `/` via the load balancer | **~31,700 req/s** | the edge is not the limit either |
-| One request, no contention (VU=1) | **~2.6 ms** | the per-op code path is cheap and healthy |
-| 50/50 account ops, under load | **~2,000–3,800 req/s** | the real ceiling for transactional ops |
-| Read-only vs write-only | **~2,000 vs ~1,625 req/s** | reads are *not* cheaper — they ride the transaction subsystem too |
-| Postgres commits per op | **~4.5** (idle baseline ≈ 0) | every op is a distributed transaction |
-| CPU at the ceiling | **~1.3 of 16 cores** | **coordination-bound, not compute-bound** |
+### Why the actor model instead of a classic relational / MVC app?
 
-> **This is the architectural ceiling, stated plainly: a single Orleans cluster + single Postgres caps
-> at a few thousand transactional ops/sec regardless of spare cores, because the limiter is 2PC
-> coordination round-trips.** Throwing hardware at one cluster does nothing — the cores sit idle.
-> 11,600 req/s of transactional operations is therefore *not* reachable on one cluster.
+It trades **easy global querying and operational simplicity** for **lock-free per-entity correctness
+and write-scaling past one database**. It's the right call when the hard problem is high-contention,
+exact, per-entity writes (a bank's money path); a relational/MVC app is simpler and better for
+query-heavy, lower-contention workloads. At very large scale you use **both** — an actor core for the
+writes and a relational/columnar plane for the queries (§7).
 
-**The path to a billion/day** — in order of leverage:
+### What about a "hot" account that everyone hits at once?
 
-1. **Take the cheap half off the transaction path (read model, §7.5).** A real bank is read-heavy
-   (balance checks, statements, history) — most requests don't move money. Serving those from an
-   eventually-consistent projection (updated *post-commit*, never blocking the money path) turns ~50%+
-   of traffic into edge-speed reads and multiplies effective throughput several ×. The overdraft check
-   stays on the authoritative grain, so no correctness is lost.
-2. **Do fewer 2PC participants per write.** Co-locate an account's *current* ledger page inside the
-   account grain so a deposit/withdrawal is a **single-participant** transaction and a transfer is two
-   (not four); full pages flush to archive `LedgerPageGrain`s. This is flaw-free only while the balance
-   stays transactional (transfers require it) — making the balance fully non-transactional would break
-   transfer isolation, so that is explicitly *not* on the table.
-3. **Shard into independent cells — the real horizontal lever.** Because the limiter is *per-cluster*
-   coordination, you scale by running **K independent clusters**, each its own silos + Postgres, and
-   routing every account to one cell by a stable hash. The account is the natural shard key, so all
-   single-account ops stay inside one cell, and K cells deliver ≈ K× the per-cell ceiling. With today's
-   ~3,000 ops/sec/cell, ~14 cells clear the 11,600/s average with peak headroom; combined with levers 1
-   and 2 (raising a cell to ~10k+ ops/sec), **~4–6 cells** suffice. The stateless edge scales separately
-   behind the load balancer.
-   - *Cross-cell transfers* (two accounts in different cells) need a **saga** (reserve → commit, with
-     compensation) or a per-cell settlement account; same-cell transfers stay a local 2PC. That is the
-     one genuine new tradeoff sharding introduces, and it touches only transfers, not balances.
-
-Net: a billion/day is a **sharding-into-cells** problem plus **moving reads off transactions** — both
-behavior-preserving — not a "buy a bigger machine" problem. Every layer has an independent horizontal
-lever; the only thing that *must* serialize is a single account near a zero balance.
-
-**Measured impact of levers 1 & 2 (implemented).** On the same box, with no behaviour change:
-
-| Workload | Before | After (levers 1 + 2) |
-|---|---|---|
-| **read-only** (read-heavy) | ~2,100 req/s | **~11,800 req/s · ~0 commits/read** |
-| 50/50 read-write mix | ~2,100 req/s · p95 141 ms | **~3,100 req/s · p95 80 ms** |
-| read latency (avg, in the mix) | ~32 ms | **~13 ms** (served from the read model) |
-
-The read model (lever 1) takes balance reads **completely** off the transaction coordinator — a
-read-only workload commits ≈0 rows per read and **already clears the 11,600 req/s target on a single
-cell**. Co-locating the ledger (lever 2) makes writes single-participant, lifting the still-write-bound
-50/50 mix ~1.5×. So a *read-heavy* bank (most traffic is balance/statement checks) is already there on
-one cell; the *write* half is what cells (lever 3) scale past one cell.
-
-### 7.7 The irreducible floors (honest limits)
-
-Some things cannot be parallelized away, by the nature of distributed correctness — these are floors,
-not defects:
-
-- **A global membership view.** All silos must agree on who is in the cluster. Tiny and low-traffic,
-  but centralized.
-- **Cross-shard commit cost.** A transfer between accounts on different storage shards commits to two
-  databases. It stays ACID; it just isn't free. (Co-location keeps single-account ops to one DB.)
-- **The near-zero boundary.** When a striped account is nearly empty, debits must coordinate so two
-  actors don't both spend the last dollar. Near the boundary, you *must* serialize.
-
-The takeaway: ActorBank already scales out across silos for compute and across replicas for the edge;
-storage sharding and escrow striping are the remaining levers to push the *write* ceiling arbitrarily
-high, and the floors above are the small, unavoidable price of keeping the books exactly correct.
+A single account is single-threaded — that's the correctness guarantee, but it caps *that* account's
+throughput. For a central **clearing/settlement** account you split it into **escrow stripes** (§7.5):
+N sub-balance grains that take credits and debits in parallel, coordinating only when the balance nears
+zero. Ordinary accounts keep the simple single-grain model.
 
 ---
 
@@ -537,29 +640,46 @@ ActorBank/
 ├─ tests/                         # k6 load/consistency tests + xUnit ACID suite
 │
 ├─ ActorBank.Abstractions/        # the contract (grain interfaces + models)
-│  ├─ Accounts/  IAccountGrain.cs, IInterestSweepGrain.cs, InterestSharding.cs
+│  ├─ Accounts/  IAccountGrain.cs, IAccountReadModelGrain.cs, IInterestSweepGrain.cs, InterestSharding.cs
 │  ├─ Ledger/    ILedgerPageGrain.cs, LedgerPaging.cs
 │  ├─ Auth/      ICredentialGrain.cs
-│  ├─ Models/    AccountStatement, TransactionRecord, TransactionType
+│  ├─ Models/    AccountStatement, TransactionRecord, TransactionType, BalanceUpdate
 │  └─ Exceptions/ BankException + domain errors
 │
 ├─ ActorBank.Grains/              # the implementation (the actors)
-│  ├─ Accounts/  AccountGrain, AccountState, InterestSweepGrain (sharded interest sweep)
+│  ├─ Accounts/  AccountGrain, AccountState, AccountReadModelGrain (balance read model),
+│  │             InterestSweepGrain (sharded interest sweep)
 │  ├─ Ledger/    LedgerPageGrain, LedgerPageState
 │  └─ Auth/      CredentialGrain, CredentialState, PasswordHasher
 │
-└─ ActorBank.Api/                 # the host (silo + web API, co-hosted)
-   ├─ Endpoints/       AccountEndpoints, AuthEndpoints   (route definitions)
-   ├─ Auth/            PqcTokenService, PqcBearerHandler, AccountOwnershipFilter
-   ├─ Contracts/       request/response DTOs
-   ├─ Infrastructure/  OrleansConfiguration, BankExceptionHandler, InterestOptions
-   ├─ Serialization/   ApiJsonSerializerContext (source-gen JSON)
-   └─ Program.cs       (thin composition root)
+├─ ActorBank.Api/                 # the host (silo + web API, co-hosted)
+│  ├─ Endpoints/       AccountEndpoints, AuthEndpoints   (route definitions)
+│  ├─ Auth/            PqcTokenService, PqcBearerHandler, AccountOwnershipFilter
+│  ├─ Contracts/       request/response DTOs
+│  ├─ Infrastructure/  OrleansConfiguration, BankExceptionHandler, InterestOptions
+│  ├─ Serialization/   ApiJsonSerializerContext (source-gen JSON)
+│  └─ Program.cs       (thin composition root)
+│
+├─ ActorBank.AppHost/             # .NET Aspire orchestrator (local dev): provisions Postgres,
+│                                 # runs the silo, and serves the dashboard — `dotnet run` here
+└─ ActorBank.ServiceDefaults/     # Aspire shared defaults: OpenTelemetry, health checks, resilience
 ```
 
 ---
 
 ## 9. Run it
+
+**With .NET Aspire** (recommended for local dev — one command brings up Postgres + the silo, with a
+live dashboard for logs, traces, and metrics):
+
+```bash
+dotnet run --project ActorBank.AppHost     # opens the Aspire dashboard; needs Docker for Postgres
+```
+
+The AppHost provisions a PostgreSQL container (initialised with the Orleans schema from `db/init`),
+injects its connection string into the API, and runs the co-hosted silo. Add `.WithReplicas(N)` in
+`AppHost.cs` to run several silos in one cluster. The dashboard URL is printed on startup; OpenTelemetry
+traces let you follow a transfer across grains.
 
 **Everything in Docker** (Postgres + API + nginx load balancer):
 
@@ -601,7 +721,7 @@ Two layers of tests:
 ```
 
 The consistency test is the headline: many concurrent transfers, then assert the total balance is
-unchanged. It's how the transfer deadlock described in §4 was found and the fix verified. See
+unchanged — proving money is conserved and that opposing transfers stay deadlock-free (§4). See
 [`tests/README.md`](tests/README.md).
 
 ---
@@ -617,18 +737,25 @@ Interest schedule is bound from the `Interest` section (`PeriodMinutes`, `RatePe
 
 ## 12. Roadmap
 
-**Done (the single-cell scaling levers — ~1.7–1.9× throughput, see §7.6)**
+**Built**
 
-- ~~**CQRS read model**~~ — `GetBalance` served from a non-transactional, post-commit projection (lever 1).
-- ~~**Fewer 2PC participants per write**~~ — the current ledger page is co-located in the account grain (lever 2).
+- **Balance read model** — `GetBalance` served from a non-transactional, post-commit projection (§7.3).
+- **Co-located ledger** — the current page lives in the account grain, so writes are single-participant (§7.3).
+- **Sharded interest sweep**, post-quantum (ML-DSA-65) auth, ADO.NET clustering, and a Docker stack.
+- **.NET Aspire dev orchestration** — `AppHost` provisions Postgres + runs the silo with OpenTelemetry and a live dashboard.
 
-**TODO (highest leverage first per the §7.6 benchmark)**
+**Next**
 
-1. **Shard into independent cells** — route accounts to K clusters by stable hash; the real
-   horizontal lever (§7.6 lever 3). Cross-cell transfers via a saga.
-2. **Escrow-striped hot accounts** — lift the hot-single-account ceiling (§7.4).
-3. **Kubernetes** — `Microsoft.Orleans.Clustering.Kubernetes`, with the silo advertising its pod IP.
-4. **Token revocation + refresh** and **rate limiting** on `/auth`.
+1. **Sharded grain storage** — route grain state to N databases within the cluster; transfers stay ACID (§7.4).
+2. **Escrow-striped hot accounts** — parallel credits and debits for a central clearing account (§7.5).
+3. **Queryable read model (reporting database)** — Orleans grain storage is a key-value store, so you
+   address grains by identity, not query them. For bank-wide queries (`SELECT … WHERE balance > …`,
+   statements, analytics), project account state into a **relational reporting store** fed by the
+   event stream — the standard OLTP/reporting split at bank scale, keeping reporting load off the
+   transactional cluster. (The `AccountReadModelGrain` already publishes post-commit; this points those
+   updates at queryable tables.)
+4. **Kubernetes** — `Microsoft.Orleans.Clustering.Kubernetes`, with the silo advertising its pod IP.
+5. **Token revocation + refresh** and **rate limiting** on `/auth`.
 
 ---
 
