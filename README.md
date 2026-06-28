@@ -464,29 +464,40 @@ share few connections — takes a single Postgres to *tens of thousands* of writ
 on (a bank can't trade `synchronous_commit`), so there's a ceiling, but it's high and most systems stop
 here.
 
-**2. Shard the grain storage across N independent Postgres.** Grain storage is a key-value store
-addressed by grain id, with no cross-row joins on the write path — ideal for sharding. A custom
-`IGrainStorage` provider routes each grain's state to one of *N* primaries by a **stable hash** of its
-key, so aggregate write throughput is *N* × per-primary, without bound. How you shard it under Orleans
-is what matters:
+**2. Shard the writes across many databases.** Grain storage is a key-value store addressed by grain
+id, with no cross-row joins on the write path — ideal for sharding. And because Orleans only ever issues
+**single-key point writes** (even a transfer's 2PC writes each account's row separately, by primary
+key), every database write lands on exactly **one** shard — so the storage layer never needs a
+cross-shard transaction of its own. There are two ways to get there.
 
-- **Keep each shard a plain Postgres; let Orleans be the only coordinator.** A transfer's two accounts
-  may live on different primaries, but the 2PC across them is *Orleans'* job — each Postgres is just a
-  local-transaction participant. One coordinator, full ACID, no sagas, still one cluster.
-- **Don't put a distributed database (Citus, CockroachDB, …) under the transactional store.** Orleans
-  already does cross-grain 2PC; a distributed engine would run its *own* 2PC across its workers
-  underneath — two stacked coordinators on the money path — and Orleans' storage schema isn't built for
-  that distribution. (Those engines are the right tool for the **reporting** store, §12 — analytical,
-  cross-row queries with nothing stacked under them — not the write path.)
-- **Use logical-shard indirection so growth is cheap.** Hash into many fixed logical buckets (e.g.
-  1024) mapped onto the physical primaries; adding a primary remaps a few buckets instead of rehashing
-  everything.
-- **Replicate each shard for HA.** Sharding (throughput) and replication (durability/failover) are
-  orthogonal — give every primary a synchronous standby (Patroni/streaming).
+**Option A — a distributed PostgreSQL (recommended).** Point Orleans at a horizontally-scaled,
+Postgres-compatible database that auto-shards by primary key, and let it spread and rebalance the
+writes for you — no custom code, no resharding to operate. This is the lowest-effort path to a
+**guaranteed** write increase: throughput grows simply by adding nodes.
 
-Result: write throughput grows with the number of primaries, transfers stay a single Orleans 2PC, and
-it is all still **one cluster**. More silos (§7.2) + sharded storage (here) + the read model (§7.3) take
-one cluster as far as you need — you never need a second cluster. *(Storage sharding is on the roadmap;
+- **YugabyteDB (YSQL)** is the cleanest fit — it reuses PostgreSQL's own query / PL-pgSQL layer and
+  shards every row by primary key automatically, so the Orleans ADO.NET provider runs with essentially
+  no app changes (you just point the connection string at it). Each shard is Raft-replicated, so HA
+  comes built in (at some per-write latency).
+- **Citus** (or managed **Azure Cosmos DB for PostgreSQL**) is the mature alternative: distribute
+  `OrleansStorage` by its `grainidhash` column and make `OrleansQuery` a reference table.
+- Use a **managed** offering (Yugabyte Aeon / Cosmos DB for PostgreSQL) so you don't run the cluster.
+  Neither is an *officially-tested* Orleans configuration, so **validate it** with the consistency suite
+  before trusting it with money — but conceptually it's sound, because Orleans only ever writes by key.
+
+**Option B — a custom sharded `IGrainStorage` over plain Postgres.** If you'd rather keep
+fully-supported, vanilla Postgres and own the sharding yourself, a small storage provider routes each
+grain's state to one of *N* independent primaries by a **stable hash** of its key:
+
+- **Orleans stays the only coordinator.** A transfer's two accounts may live on different primaries, but
+  the 2PC across them is Orleans' job — each Postgres is just a local participant. Full ACID, no sagas.
+- **Logical-shard indirection** keeps growth cheap — hash into many fixed buckets (e.g. 1024) mapped to
+  the physical primaries, so adding a primary remaps a few buckets instead of rehashing everything.
+- **Replicate each shard** (a synchronous standby) for HA — throughput and durability are orthogonal.
+- The trade-off vs Option A: **you** own resharding and data movement, which the distributed DB automates.
+
+Either way it stays **one Orleans cluster**: more silos (§7.2) + sharded writes (here) + the read model
+(§7.3) take it as far as you need — you never need a second cluster. *(Both options are on the roadmap;
 today the cluster uses a single Postgres.)*
 
 ### 7.5 Consistency: one account, one truth
@@ -580,6 +591,60 @@ co-located ledger (single-participant writes), the balance read model (cheap rea
 interest sweep, and post-quantum auth with a verification cache. Reaching 100B/day is **more of the
 same cluster, not a redesign** — add silos, shard the grain storage (§7.4), escrow-stripe the clearing
 accounts, and run the edge on Kubernetes (see the [Roadmap](#12-roadmap)).
+
+### 7.7 Serving transaction history: outbox → read store
+
+Reading the **recent statement** (last N) from the grains is fine — `GetStatement` already does it,
+bounded and fresh. But **paginating an account's whole history**, with filters, is a read concern that
+should *not* go through the grains: deep pages would cold-activate old `LedgerPageGrain`s and read
+immutable history transactionally, and grains can't filter or sort. The ledger stays **authoritative in
+the account** (committed with the balance); a **derived, paginated read model** serves that API.
+
+**The read model + API.** Project each committed entry into an append-only `account_transactions` table
+keyed by `(account_id, seq)` and serve it with **keyset (cursor) pagination** — O(page) regardless of
+depth, unlike `OFFSET`:
+
+```
+GET /accounts/{id}/transactions?cursor={lastSeq}&limit=50&from=…&to=…&type=…
+  → SELECT … WHERE account_id = :id AND seq < :cursor ORDER BY seq DESC LIMIT :n
+```
+
+**Getting entries there reliably evolves in two stages.** The trap is the *dual write* — commit, then
+publish, which can lose events. The fix is a **transactional outbox**: write the event in the *same*
+transaction as the money, so it can never be lost. From there:
+
+**Stage 1 — Postgres *is* the queue (start here; covers most scale).** The outbox table doubles as the
+queue. A projector drains it with `SELECT … FOR UPDATE SKIP LOCKED` (+ `LISTEN/NOTIFY` for low latency),
+idempotently upserting into `account_transactions` keyed by `(account_id, seq)`. No broker to run, and
+the outbox is atomic with the money. Put the outbox **in each write shard** (§7.4) so there's no single
+hotspot.
+
+```
+money commits ──(outbox row, same txn)──► outbox (per write shard)
+                                             │  projector: FOR UPDATE SKIP LOCKED + NOTIFY
+                                             ▼
+                                       account_transactions ──► paginated API
+```
+
+**Stage 2 — CDC → Kafka (evolve only when fan-out demands it).** Run **Debezium CDC on the outbox table
+→ Kafka / Azure Event Hubs**, partitioned by account id (per-account order). The projector becomes one
+consumer; fraud, analytics, notifications, and audit are independent consumers of the same log, with
+replay. **Producers don't change** — you just add a CDC connector.
+
+```
+outbox ──CDC(Debezium)──► Kafka (partition by account) ──► projector ─► account_transactions
+                                                         ├─► fraud / analytics / notifications
+                                                         └─► replay rebuilds any read store
+```
+
+**Evolve to Kafka when** you need any of: **multiple independent consumers** of the same stream,
+**replay / long retention** to rebuild read stores, a **cross-team event ecosystem**, or aggregate
+throughput beyond a sharded Postgres queue. Until then, the Postgres outbox-queue is simpler and equally
+correct.
+
+**Guarantees, either stage:** the outbox commits atomically with the money (**no loss**); the projector
+is idempotent on `(account_id, seq)` (**no duplicates**) → exactly-once *effect*. The grain ledger stays
+the source of truth and the reconciliation backstop.
 
 ---
 
@@ -746,14 +811,15 @@ Interest schedule is bound from the `Interest` section (`PeriodMinutes`, `RatePe
 
 **Next**
 
-1. **Sharded grain storage** — route grain state to N databases within the cluster; transfers stay ACID (§7.4).
+1. **Scale writes** — a distributed PostgreSQL (YugabyteDB / Citus) or a custom sharded `IGrainStorage`
+   over N primaries; transfers stay ACID, still one cluster (§7.4).
 2. **Escrow-striped hot accounts** — parallel credits and debits for a central clearing account (§7.5).
 3. **Queryable read model (reporting database)** — Orleans grain storage is a key-value store, so you
    address grains by identity, not query them. For bank-wide queries (`SELECT … WHERE balance > …`,
-   statements, analytics), project account state into a **relational reporting store** fed by the
-   event stream — the standard OLTP/reporting split at bank scale, keeping reporting load off the
-   transactional cluster. (The `AccountReadModelGrain` already publishes post-commit; this points those
-   updates at queryable tables.)
+   statements, analytics) and **paginated transaction history** (`GET /accounts/{id}/transactions`),
+   project account state into a **relational reporting store** via a **transactional outbox + projector**
+   (Postgres-as-queue now, CDC→Kafka later — §7.7), keeping reporting load off the transactional cluster.
+   (The `AccountReadModelGrain` already publishes post-commit; this extends that to queryable tables.)
 4. **Kubernetes** — `Microsoft.Orleans.Clustering.Kubernetes`, with the silo advertising its pod IP.
 5. **Token revocation + refresh** and **rate limiting** on `/auth`.
 
