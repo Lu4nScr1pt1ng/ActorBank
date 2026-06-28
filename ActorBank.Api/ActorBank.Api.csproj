@@ -12,6 +12,7 @@
   <ItemGroup>
     <ProjectReference Include="..\ActorBank.Grains\ActorBank.Grains.csproj" />
     <ProjectReference Include="..\ActorBank.Abstractions\ActorBank.Abstractions.csproj" />
+    <ProjectReference Include="..\ActorBank.ServiceDefaults\ActorBank.ServiceDefaults.csproj" />
   </ItemGroup>
 
   <ItemGroup>

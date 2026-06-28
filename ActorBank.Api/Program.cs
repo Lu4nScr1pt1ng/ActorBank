@@ -7,6 +7,10 @@ using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Aspire service defaults: OpenTelemetry (traces/metrics/logs), health checks, service discovery,
+// and HTTP resilience. Harmless without Aspire — it just wires telemetry/health for the dashboard.
+builder.AddServiceDefaults();
+
 // Co-host the Orleans silo (clustering + ADO.NET storage + transactions).
 builder.AddActorBankSilo();
 builder.Services.Configure<InterestOptions>(builder.Configuration.GetSection("Interest"));
@@ -33,6 +37,9 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
+
+// Aspire health endpoints (/health, /alive) for the dashboard and k8s probes.
+app.MapDefaultEndpoints();
 
 app.UseExceptionHandler();
 
