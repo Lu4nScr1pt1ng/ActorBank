@@ -34,7 +34,7 @@ builder.Services.AddExceptionHandler<BankExceptionHandler>();
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, ApiJsonSerializerContext.Default));
 
-builder.Services.AddOpenApi();
+builder.Services.AddActorBankOpenApi();
 
 var app = builder.Build();
 
