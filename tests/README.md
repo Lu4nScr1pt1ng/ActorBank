@@ -10,7 +10,7 @@ Two complementary layers:
 ## xUnit (correctness)
 
 ```bash
-dotnet test tests/ActorBank.Tests        # 8 tests, ~1s, no Docker
+dotnet test tests/ActorBank.Tests        # 22 cases (17 methods), ~2s, no Docker
 ```
 
 | Test | Asserts |
@@ -22,7 +22,16 @@ dotnet test tests/ActorBank.Tests        # 8 tests, ~1s, no Docker
 | `Money_is_conserved_under_concurrent_transfers` | **isolation** — 120 concurrent transfers, total conserved |
 | `Concurrent_deposits_have_no_lost_updates` | 100 concurrent deposits → exact balance |
 | `Ledger_pages_across_many_transactions` | paging across the 128-entry page boundary |
+| `Ledger_is_correct_across_page_boundaries` *(theory)* | the co-located current page flushes correctly at 127 / 128 / 129 / 256 entries |
 | `Apply_interest_credits_and_records_an_entry` | interest credit + ledger entry |
+| `Cold_read_model_returns_null` | the balance read model is empty until published |
+| `Publish_records_the_balance` | a published balance reads back |
+| `Stale_publish_is_ignored_and_newer_one_wins` | the read model's version guard |
+| `Account_operations_return_a_monotonic_version` | money ops return an increasing version |
+| `ShardOf_is_in_range` *(theory)* | interest-shard hash maps into `[0, shards)` |
+| `ShardOf_is_stable_for_the_same_id` | the hash is deterministic across calls |
+| `ShardOf_spreads_accounts_across_shards` | accounts distribute across the pool |
+| `ShardOf_rejects_a_nonpositive_shard_count` | guards invalid input |
 
 Transfers are composed the same way as the API (one transaction over both account grains, legs in
 id order) via a small test-only coordinator grain.
@@ -48,8 +57,13 @@ docker compose up -d                 # 1 silo behind nginx on :8080
 ./tests/run.sh stress.js        # ramp VUs to find the breaking point
 ```
 
+**Or run the app with [.NET Aspire](../README.md#9-run-it)** — `dotnet run --project ActorBank.AppHost`
+pins the API to `:8080`, so the same `./tests/run.sh` commands work unchanged (plus a live dashboard).
+Docker Compose (`--scale app=N` + nginx) is still the better harness for **load** runs across silos.
+
 Most scripts accept env knobs, e.g. `ACCOUNTS=20 VUS=30 DURATION=40s ./tests/run.sh consistency.js`
-or `POOL=40 PEAK=60 ./tests/run.sh load.js`. `BASE_URL` overrides the target if you aren't on `:8080`.
+or `POOL=200 PEAK=200 WRITE_RATIO=0.1 ./tests/run.sh load.js` (`WRITE_RATIO` 0–1 sets the read/write
+mix). `BASE_URL` overrides the target if you aren't on `:8080`.
 
 ## What each script proves
 
@@ -70,14 +84,17 @@ collapsed to ~3 req/s with 30s timeouts. Money was still conserved (failed trans
 but the behaviour was unacceptable. Fixed by orchestrating the transfer transaction from the API via
 `ITransactionClient` (account grains never call each other).
 
-## Latest numbers (local Docker)
+## Latest numbers (local Docker — Ryzen 7 5700G, 8c/16t, `--scale app=2`)
 
-| | 1 silo | 3 silos (`--scale app=3`, via nginx) |
-|---|--------|--------------------------------------|
-| `consistency.js` | conserved, ~157 transfers/s, p95 ~160ms | conserved, ~225 transfers/s, p95 ~243ms |
-| `load.js` | ~900 req/s, p95 ~60ms, 0 failures | ~985 req/s, p95 ~73ms, 0 failures |
+| `load.js` workload (set `WRITE_RATIO`) | Throughput |
+|---|---|
+| read-only (`WRITE_RATIO=0`) | ~10,700 req/s |
+| 90 / 10, realistic bank mix (`WRITE_RATIO=0.1`) | ~7,300 req/s |
+| 50 / 50 (`WRITE_RATIO=0.5`) | ~3,100 req/s, p95 ~80ms |
+| write-only (`WRITE_RATIO=1`) | ~2,000 writes/s |
+| `consistency.js` | money conserved under concurrent transfers (the headline) |
 
-Throughput scales with nodes but isn't 3× — Postgres and the transaction coordinator are a shared
-back end. Going through nginx costs ~10% vs hitting nodes directly (open-source nginx can't keep a
-keepalive pool to a dynamically-discovered upstream); irrelevant at this load, where the proxy is
-nowhere near its limit.
+Reads ride the **balance read model** (≈0 DB commits), so a read-heavy workload is far cheaper than a
+write — see [README §7.6](../README.md#76-worked-example-a-100-billion-request-a-day-bank) for the full
+measured breakdown and the per-op commit analysis. Throughput is bound by the single PostgreSQL (the
+transaction coordinator is distributed); scaling writes means sharding the database (README §7.4).

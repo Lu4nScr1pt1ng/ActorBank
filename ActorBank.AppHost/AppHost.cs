@@ -10,8 +10,11 @@ var orleansDb = builder.AddPostgres("postgres")
     .AddDatabase("orleans");
 
 // The co-hosted API + Orleans silo. Add .WithReplicas(N) to run several silos in one cluster locally.
+// Pin a stable HTTP port (8080) so the k6 tests work against Aspire unchanged — `./tests/run.sh`
+// defaults to http://localhost:8080.
 builder.AddProject<Projects.ActorBank_Api>("app")
     .WithReference(orleansDb)
-    .WaitFor(orleansDb);
+    .WaitFor(orleansDb)
+    .WithHttpEndpoint(name: "k6", port: 8080);
 
 builder.Build().Run();
