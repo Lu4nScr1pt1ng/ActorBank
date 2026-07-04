@@ -187,7 +187,19 @@ signed bearer tokens at the API edge. Single-threaded access means `Register` an
 *Key = shard index.* Rather than one durable reminder per account (which would mean millions of
 reminders), a small fixed pool of sweep coordinators each own **one** reminder. On each tick a sweep
 grain credits every account enrolled in its shard by calling `AccountGrain.ApplyInterest`. Accounts map
-to shards by a stable FNV-1a hash (`InterestSharding`).
+to shards by a stable FNV-1a hash (`InterestSharding`). Ticks run with **bounded concurrency** (batches
+of 32) and per-account failure isolation — one bad account can't abort the sweep — and credits are
+rounded to cents with **banker's rounding** (`MidpointRounding.ToEven`), the standard for finance.
+
+> **At bank scale you'd evolve this to lazy accrual.** The sweep is the right *push-based* actor
+> pattern, but it has two costs that grow with the customer base: each tick wakes **every** enrolled
+> account — including dormant ones — and each shard's enrollment set grows without bound. Real core
+> banking treats interest as a **function of time, not an event**: store a `LastAccrualAt` timestamp on
+> the account and, on the next operation that touches it, compute and credit the interest accrued since
+> — inside the transaction that is already open. Dormant accounts then cost *nothing* (their interest is
+> just arithmetic waiting to be posted), a missed tick can't lose money (catch-up is exact, from
+> timestamps), and the sweep shrinks to a small posting run over **active** accounts at statement
+> boundaries. See the [Roadmap](#12-roadmap).
 
 ### `AccountReadModelGrain` — a cheap, non-transactional balance
 *Key = account id.* A projection of the balance, updated *after* each committed operation and read
@@ -311,6 +323,11 @@ authorized **without touching a grain**:
 - **Ownership, enforced.** `AccountOwnershipFilter` requires the token's subject to equal the `{id}` in the
   route — so a valid token for `alice` still gets **403** on `bob`'s account. You can only touch your own.
 - The verifying **public key** is published at `GET /auth/jwks` (the private signing key never leaves the silo).
+
+Two details worth noticing: the password check uses a **timing-safe comparison**
+(`CryptographicOperations.FixedTimeEquals`), and scaled replicas **share one signing-key file** with
+race-safe creation — the first silo to boot generates it, the rest read it — so a token issued by any
+node verifies on every node.
 
 So the edge stays **stateless** — any replica verifies any token — and the per-request crypto stays off the
 critical path.
@@ -823,14 +840,17 @@ Interest schedule is bound from the `Interest` section (`PeriodMinutes`, `RatePe
 1. **Scale writes** — a distributed PostgreSQL (YugabyteDB / Citus) or a custom sharded `IGrainStorage`
    over N primaries; transfers stay ACID, still one cluster (§7.4).
 2. **Escrow-striped hot accounts** — parallel credits and debits for a central clearing account (§7.5).
-3. **Queryable read model (reporting database)** — Orleans grain storage is a key-value store, so you
+3. **Lazy interest accrual** — replace the tick-driven sweep with a per-account `LastAccrualAt` +
+   on-touch accrual (§4): dormant accounts cost nothing, downtime catch-up is exact from timestamps,
+   and scheduled work shrinks to a posting run over active accounts.
+4. **Queryable read model (reporting database)** — Orleans grain storage is a key-value store, so you
    address grains by identity, not query them. For bank-wide queries (`SELECT … WHERE balance > …`,
    statements, analytics) and **paginated transaction history** (`GET /accounts/{id}/transactions`),
    project account state into a **relational reporting store** via a **transactional outbox + projector**
    (Postgres-as-queue now, CDC→Kafka later — §7.7), keeping reporting load off the transactional cluster.
    (The `AccountReadModelGrain` already publishes post-commit; this extends that to queryable tables.)
-4. **Kubernetes** — `Microsoft.Orleans.Clustering.Kubernetes`, with the silo advertising its pod IP.
-5. **Token revocation + refresh** and **rate limiting** on `/auth`.
+5. **Kubernetes** — `Microsoft.Orleans.Clustering.Kubernetes`, with the silo advertising its pod IP.
+6. **Token revocation + refresh** and **rate limiting** on `/auth`.
 
 ---
 
